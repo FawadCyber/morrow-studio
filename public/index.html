@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Morrow Studio</title>
+  <meta name="description" content="Morrow Studio — leather jacket sourcing by Morrow">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="color-scheme" content="dark light">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/favicon.ico?v=2" sizes="any">
+  <link rel="icon" href="/icons/favicon-32.png?v=2" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <script>
+    // set the theme before the first paint (no flash)
+    (function () { try { var t = localStorage.getItem('lh-theme') || 'auto'; var d = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches); document.documentElement.dataset.theme = d ? 'dark' : 'light'; } catch (e) {} })();
+    // Fit to screen: on laptop/desktop screens show the page like a ~1900px wide screen (same as browser zoom ~67% on a 1280px laptop)
+    window.lhFit = function () {
+      var h = document.documentElement, size = 'fit';
+      try { size = localStorage.getItem('lh-size') || 'fit'; } catch (e) {}
+      var w = window.innerWidth, target = { fit: 1900, medium: 1600 }[size];
+      if (!(window.CSS && CSS.supports && CSS.supports('zoom', '0.5'))) target = null; // older browsers: normal size
+      var z = target && w >= 1000 ? Math.min(1, Math.max(0.6, w / target)) : 1;
+      z = Math.round(z * 1000) / 1000;
+      h.style.zoom = z < 1 ? z : '';
+      h.style.setProperty('--z', z);
+      h.classList.toggle('fit', z < 1);
+      window.lhZoom = z;
+    };
+    lhFit();
+    window.addEventListener('resize', lhFit);
+  </script>
+</head>
+<body>
+  <div id="root"><div class="boot"><img src="/icons/morrow.png" alt="Morrow" width="64" height="64"><i class="spinner"></i></div></div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <noscript><p style="padding:24px">Morrow Studio needs JavaScript turned on.</p></noscript>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

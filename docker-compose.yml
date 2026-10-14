@@ -1,0 +1,39 @@
+services:
+  leather-hunt:
+    build: .
+    container_name: leather-hunt
+    restart: unless-stopped
+    env_file: .env            # DASHBOARD_PASSWORD, INGEST_KEY, DATABASE_URL (PostgreSQL)
+    environment:
+      PUBLIC_URL: https://morrow.example.com
+      NODE_OPTIONS: --max-old-space-size=1536
+    ports:
+      - "127.0.0.1:4300:4300" # only reachable on the server itself; the public way in is HTTPS below
+    volumes:
+      - ./data:/data          # jackets, photos, backups and the CLIP model
+    mem_limit: 2500m          # the photo AI (CLIP) needs room; the server has ~3 GB free
+    networks:
+      - n8n_default           # n8n reaches the dashboard at http://leather-hunt:4300
+      - freshdesk-v3          # the PostgreSQL server (freshdesk-v3-postgres) holds the morrow_studio database
+    labels:
+      # Free HTTPS (Let's Encrypt) through the Traefik proxy that already serves n8n
+      - traefik.enable=true
+      - traefik.docker.network=n8n_default
+      - traefik.http.routers.leather.rule=Host(`studio.example.com`)
+      - traefik.http.routers.leather.entrypoints=websecure
+      - traefik.http.routers.leather.tls=true
+      - traefik.http.routers.leather.tls.certresolver=mytlschallenge
+      - traefik.http.routers.leather.service=leather
+      - traefik.http.services.leather.loadbalancer.server.port=4300
+      # Morrow Studio address (free DuckDNS name), with its own free certificate
+      - traefik.http.routers.morrow.rule=Host(`morrow.example.com`)
+      - traefik.http.routers.morrow.entrypoints=websecure
+      - traefik.http.routers.morrow.tls=true
+      - traefik.http.routers.morrow.tls.certresolver=mytlschallenge
+      - traefik.http.routers.morrow.service=leather
+
+networks:
+  n8n_default:
+    external: true
+  freshdesk-v3:
+    external: true

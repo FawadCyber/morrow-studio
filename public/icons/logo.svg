@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fafafa"/><stop offset=".55" stop-color="#c4c4c4"/><stop offset="1" stop-color="#7c7c7c"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="#161616"/>
+  <rect x="3" y="3" width="58" height="58" rx="13" fill="none" stroke="url(#g)" stroke-width="1.5" opacity=".55"/>
+  <!-- jacket silhouette: collar, zip, sleeves -->
+  <path d="M22 17l10 6 10-6 8 4 4 22-6 2-3-14v21H19V30l-3 14-6-2 4-22z" fill="none" stroke="url(#g)" stroke-width="2.4" stroke-linejoin="round"/>
+  <path d="M32 23v27M27 20l5 9 5-9" fill="none" stroke="url(#g)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,1078 @@
+{
+  "name": "Leather Hunt - Leather Jacket Hunter",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "leather-hunt",
+        "options": {}
+      },
+      "id": "295b52f0-0ba2-4d1e-a5d2-51b4924b0206",
+      "name": "Leather Hunt Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "e776c9da-eb1a-4ff1-9013-ccacddc3b502"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "d0e6ef25-69cd-472d-b5b9-c1b29127c1b6",
+              "leftValue": "={{ $json.headers?.['x-ingestion-key'] || '' }}",
+              "rightValue": "CHANGE_ME_INGEST_KEY",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6812f967-8d2d-4987-bca2-7a700ecb2b7d",
+      "name": "Authorized Leather Hunt?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        224,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ingestion key arrives with the hunt request (checked by \"Authorized Leather Hunt?\"); it is not written in the nodes.\nconst KEY = () => (($('Leather Hunt Webhook').first().json || {}).headers || {})['x-ingestion-key'] || '';\n// Was this hunt stopped (or timed out) in the dashboard? Then every step quits straight away.\nasync function shouldStop(helpers) {\n  try {\n    const c = $('Hunt Config').first().json;\n    if (!c.run_id) return false;\n    const r = await helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/state?runId=' + encodeURIComponent(c.run_id), method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 5000 });\n    return !!(r && r.stop);\n  } catch (e) { return false; }\n}\nasync function report(helpers, cfg, body) {\n  // Tells the dashboard how the hunt is going. Never stops the hunt if the dashboard can't be reached.\n  if (!cfg || !cfg.run_id || !cfg.dashboard_url) return;\n  try {\n    await helpers.httpRequest({ url: cfg.dashboard_url + '/api/hunt/progress', method: 'POST', headers: { 'X-Ingestion-Key': KEY() }, body: { runId: cfg.run_id, ...body }, json: true, timeout: 5000 });\n  } catch (e) {}\n}\n\n  // Google Trends, last 24 hours. Never stops the hunt: any failure is noted and the hunt goes on.\n  //  - Trending searches per country (public RSS feed) with their news photos -> dashboard checks photos for leather jackets\n  //  - Rising / top searches around \"leather jacket\" (Trends explore data, rate limited by Google: skipped on 429)\n  const body = $('Leather Hunt Webhook').first().json.body || {};\n  const list = v => (Array.isArray(v) ? v : String(v || '').split(/[\\n,]/)).map(s => String(s).trim()).filter(Boolean);\n  const markets = list(body.markets).map(m => m.toUpperCase()).filter(m => ['US', 'UK', 'CA'].includes(m));\n  const geos = (markets.length ? markets : ['US', 'UK', 'CA']).map(m => m === 'UK' ? 'GB' : m);\n  const dashboard = String(body.dashboardUrl || 'http://host.docker.internal:4300').replace(/\\/+$/, '');\n  const started = Date.now();\n  const timeLeft = () => Date.now() - started < 40000;\n  const JACKET = /\\b(leather|jacket|jackets|biker|bomber|moto|motorcycle|suede|shearling|aviator|racer|trucker|blouson)\\b/i;\n  const NOT_WANTED = /\\b(cheap|diy|how to|clean|repair|meme|lyrics|costume)\\b/i;\n\n  const decode = s => String(s || '').replace(/<!\\[CDATA\\[|\\]\\]>/g, '').replace(/&amp;/g, '&').replace(/&quot;/g, '\"').replace(/&#39;|&apos;/g, \"'\").replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();\n  const tag = (xml, name) => decode((xml.match(new RegExp(`<${name}>([\\\\s\\\\S]*?)</${name}>`, 'i')) || [])[1]);\n  const fetchText = async (url, headers = {}) => {\n    const res = await this.helpers.httpRequest({ url, method: 'GET', headers, timeout: 15000, returnFullResponse: true, ignoreHttpStatusErrors: true, encoding: 'text' });\n    return { status: res.statusCode, text: typeof res.body === 'string' ? res.body : JSON.stringify(res.body), headers: res.headers || {} };\n  };\n\n  const out = { fetched_at: new Date().toISOString(), run_id: String(body.runId || ''), mode: body.mode === 'trend' ? 'trend' : 'normal', markets: {}, notes: [] };\n\n  // 1) Trending searches, last 24h\n  for (const geo of geos) {\n    if (!timeLeft()) break;\n    const m = (out.markets[geo] = { trending: [], rising: [], top: [] });\n    try {\n      const r = await fetchText(`https://trends.google.com/trending/rss?geo=${geo}`);\n      if (r.status !== 200) { out.notes.push(`${geo} trending feed: HTTP ${r.status}`); continue; }\n      for (const item of r.text.split(/<item>/i).slice(1)) {\n        const news = item.split(/<ht:news_item>/i).slice(1).map(n => ({\n          title: tag(n, 'ht:news_item_title'),\n          url: tag(n, 'ht:news_item_url'),\n          picture: tag(n, 'ht:news_item_picture'),\n          source: tag(n, 'ht:news_item_source')\n        })).filter(n => n.url);\n        m.trending.push({\n          topic: tag(item, 'title'),\n          traffic: tag(item, 'ht:approx_traffic'),\n          started: tag(item, 'pubDate'),\n          picture: tag(item, 'ht:picture'),\n          news\n        });\n      }\n    } catch (e) { out.notes.push(`${geo} trending feed: ${e.message}`); }\n  }\n\n  // 2) Searches around \"leather jacket\", last 24h (best effort: Google rate limits this)\n  let cookie = '';\n  try {\n    const home = await fetchText('https://trends.google.com/trends/?geo=US');\n    cookie = [].concat(home.headers['set-cookie'] || []).map(c => String(c).split(';')[0]).join('; ');\n  } catch (e) {}\n  const trendsJson = async url => {\n    const r = await fetchText(url, cookie ? { Cookie: cookie } : {});\n    if (r.status === 429) throw Object.assign(new Error('Google rate limit (429), skipped this run'), { stop: true });\n    if (r.status !== 200) throw new Error('HTTP ' + r.status);\n    return JSON.parse(r.text.slice(r.text.indexOf('{')));\n  };\n  for (const geo of geos) {\n    if (!timeLeft()) break;\n    try {\n      const req = { comparisonItem: [{ keyword: 'leather jacket', geo, time: 'now 1-d' }], category: 0, property: '' };\n      const ex = await trendsJson('https://trends.google.com/trends/api/explore?hl=en-US&tz=0&req=' + encodeURIComponent(JSON.stringify(req)));\n      const w = (ex.widgets || []).find(x => x.id === 'RELATED_QUERIES');\n      if (!w) continue;\n      const d = await trendsJson('https://trends.google.com/trends/api/widgetdata/relatedsearches?hl=en-US&tz=0&req=' + encodeURIComponent(JSON.stringify(w.request)) + '&token=' + w.token);\n      const [top, rising] = (d.default?.rankedList || []).map(l => (l.rankedKeyword || []).map(k => ({ query: k.query, value: k.formattedValue })));\n      out.markets[geo].top = (top || []).slice(0, 15);\n      out.markets[geo].rising = (rising || []).slice(0, 15);\n    } catch (e) {\n      out.notes.push(`${geo} leather jacket searches: ${e.message}`);\n      if (e.stop) break;\n    }\n  }\n\n  // Best 5 topics around \"leather jacket\" for today's trend hunt\n  const topicList = [];\n  for (const m of Object.values(out.markets)) for (const r of [...m.rising, ...m.top]) topicList.push(r.query);\n  out.topics = [...new Set(topicList.map(t => String(t).toLowerCase().trim()))]\n    .filter(t => t && JACKET.test(t) && !NOT_WANTED.test(t)).slice(0, 5);\n\n  // Extra search phrases for this hunt: rising first, then trending topics that are about jackets\n  const phrases = [];\n  for (const m of Object.values(out.markets)) {\n    for (const r of m.rising) phrases.push(r.query);\n    for (const t of m.trending) if (JACKET.test(t.topic)) phrases.push(t.topic);\n    for (const r of m.top.slice(0, 3)) phrases.push(r.query);\n  }\n  out.trend_keywords = [...new Set(phrases.map(p => p.toLowerCase().trim()))]\n    .filter(p => JACKET.test(p) && !NOT_WANTED.test(p))\n    .map(p => /leather|suede|shearling/.test(p) ? p : p + ' leather')\n    .slice(0, 6);\n\n  // Hand the snapshot to the dashboard (it checks the news photos for leather jackets)\n  try {\n    await this.helpers.httpRequest({ url: dashboard + '/api/trends/ingest', method: 'POST', headers: { 'X-Ingestion-Key': KEY() }, body: out, json: true, timeout: 20000 });\n  } catch (e) { out.notes.push('dashboard: ' + e.message); }\n\n  await report(this.helpers, { run_id: String(body.runId || ''), dashboard_url: dashboard }, {\n    step: 'Google Trends', status: 'done', count: out.topics.length,\n    detail: (out.topics.length ? 'Top topics: ' + out.topics.join(', ') : 'No leather jacket topics in the last 24 hours') + (out.notes.length ? ' · ' + out.notes.join(' · ') : '')\n  });\n  return [{ json: { trend_keywords: out.trend_keywords, topics: out.topics, notes: out.notes, trending_topics: Object.values(out.markets).reduce((n, m) => n + m.trending.length, 0) } }];\n"
+      },
+      "id": "e310fc0e-3958-4bfe-908c-ff4ba4238641",
+      "name": "Google Trends",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        400
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function urlParts(value) {\n  // n8n Code nodes have no URL class, so split URLs by hand\n  const m = String(value || '').trim().match(/^(https?):\\/\\/([^\\/?#:]+)(:\\d+)?([^?#]*)/i);\n  if (!m) return null;\n  const host = m[2].toLowerCase();\n  return { origin: m[1].toLowerCase() + '://' + host + (m[3] || ''), host, pathname: m[4] || '/' };\n}\n\n  // Reads hunt settings from the webhook body. Every field is optional.\n  const body = $('Leather Hunt Webhook').first().json.body || {};\n  const num = (v, d) => { const n = Number(v); return v !== '' && v !== null && v !== undefined && Number.isFinite(n) && n >= 0 ? n : d; };\n  const list = v => (Array.isArray(v) ? v : String(v || '').split(/[\\n,]/)).map(s => String(s).trim()).filter(Boolean);\n\n  let minPrice = num(body.minPrice ?? body.priceRange?.min, 0);\n  let maxPrice = num(body.maxPrice ?? body.priceRange?.max, 100000);\n  if (minPrice > maxPrice) [minPrice, maxPrice] = [maxPrice, minPrice];\n\n  const websites = [...new Set(list(body.websites)\n    .map(w => /^https?:\\/\\//i.test(w) ? w : 'https://' + w)\n    .map(w => urlParts(w)?.origin || '')\n    .filter(Boolean))];\n\n  const sources = list(body.sources).map(s => s.toLowerCase());\n  const base = list(body.keywords);\n  let trend = [];\n  try { trend = $('Google Trends').first().json.trend_keywords || []; } catch (e) {}\n  const celeb = list(body.trendKeywords).slice(0, 5);\n  const keywords = base;\n  const extra = [...new Set([...celeb, ...trend].map(k => k.toLowerCase()))];\n  const markets = list(body.markets).map(m => m.toUpperCase()).filter(m => ['US', 'UK', 'CA'].includes(m));\n\n  return [{ json: {\n        min_price: minPrice,\n    max_price: maxPrice,\n    include_unpriced: body.includeUnpriced === true,\n    allow_faux: body.allowFaux === true,\n    keywords: [...new Set([...extra, ...(keywords.length ? keywords : [\n      \"women's leather jacket\", \"men's leather jacket\", 'leather biker jacket', 'leather bomber jacket',\n      'leather moto jacket', 'shearling leather jacket', 'vintage leather jacket', 'suede leather jacket'\n    ])])].slice(0, 14),\n    trend_keywords: extra,\n    mode: body.mode === 'trend' ? 'trend' : 'normal',\n    serper_key: String(body.serperKey || ''),\n    markets: markets.length ? markets : ['US', 'UK', 'CA'],\n    sources: body.mode === 'trend' ? ['google_shopping'] : sources.length ? sources : ['ebay', 'etsy', 'websites'],\n    websites,\n    per_query_limit: Math.min(num(body.perQueryLimit, 25), 50),\n    max_pages_per_site: Math.min(num(body.maxPagesPerSite, 30), 300),\n    top_n: body.mode === 'trend' ? 50 : Math.max(1, Math.min(num(body.topN, 10), 100)),\n    run_id: String(body.runId || ''),\n    dashboard_url: String(body.dashboardUrl || 'http://leather-hunt:4300').replace(/\\/+$/, ''),\n    started_at: new Date().toISOString()\n  }}];\n"
+      },
+      "id": "eb429432-e10f-4d58-a167-da9c572be417",
+      "name": "Hunt Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ingestion key arrives with the hunt request (checked by \"Authorized Leather Hunt?\"); it is not written in the nodes.\nconst KEY = () => (($('Leather Hunt Webhook').first().json || {}).headers || {})['x-ingestion-key'] || '';\n// Was this hunt stopped (or timed out) in the dashboard? Then every step quits straight away.\nasync function shouldStop(helpers) {\n  try {\n    const c = $('Hunt Config').first().json;\n    if (!c.run_id) return false;\n    const r = await helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/state?runId=' + encodeURIComponent(c.run_id), method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 5000 });\n    return !!(r && r.stop);\n  } catch (e) { return false; }\n}\nfunction isLeatherJacket(text, allowFaux) {\n  const t = String(text || '').toLowerCase().replace(/%20|[-_/+]+/g, ' ');\n  if (!/\\bleather\\b|\\bsuede\\b|\\bshearling\\b|\\bnappa\\b|\\blambskin\\b|\\bcowhide\\b/.test(t)) return false;\n  if (!/\\b(jacket|jackets|bomber|biker|moto|motorcycle|racer|trucker|aviator|blouson|shacket)\\b/.test(t)) return false;\n  // other products that mention leather jackets (a jacket \"with belt\", a \"shirt jacket\" or \"wool lining\" still counts)\n  if (/\\b(vest|waistcoat|gilet|pants|trousers|skirt|chaps|pattern|pdf|patch|patches|sticker|keychain|keyring|key ring|wallet|bag|purse|gloves|boots|shoes|hanger|cleaner|conditioner|toy|doll|barbie|dog|helmet|lot of|bundle|phone case|case for|earring|earrings|necklace|magnet|ornament|miniature)\\b/.test(t)) return false;\n  if (/\\b(overcoat|trench|duster|parka|peacoat|tuxedo|suit|suits|turtleneck|sweater|hoodie only)\\b/.test(t)) return false;\n  if (/\\b(coat|coats)\\b/.test(t) && !/\\bjackets?\\b/.test(t)) return false;\n  if (!allowFaux && /\\b(faux|vegan|pu leather|pleather|leatherette|imitation|synthetic leather)\\b/.test(t)) return false;\n  return true;\n}\n\nfunction inPriceRange(price, cfg) {\n  const p = Number(price);\n  if (!Number.isFinite(p) || p <= 0) return cfg.include_unpriced === true;\n  return p >= cfg.min_price && p <= cfg.max_price;\n}\n\nfunction httpsImages(values) {\n  return [...new Set(values.flat(Infinity).map(v => typeof v === 'string' ? v : (v && (v.imageUrl || v.url_fullxfull || v.url_570xN || v.contentUrl || v.url || v.src)) || '')\n    .map(v => String(v || '').trim().replace(/&amp;/g, '&').replace(/^\\/\\//, 'https://').replace(/^http:\\/\\//i, 'https://'))\n    .filter(v => /^https:\\/\\//i.test(v))\n    .filter(v => !/\\.(gif|svg)(\\?|$)/i.test(v))\n    .filter(v => !/(placeholder|no[-_ ]?image|logo|favicon|sprite|icon|avatar|pixel|size[-_ ]?chart|payment|badge)/i.test(v)))];\n}\n\nasync function report(helpers, cfg, body) {\n  // Tells the dashboard how the hunt is going. Never stops the hunt if the dashboard can't be reached.\n  if (!cfg || !cfg.run_id || !cfg.dashboard_url) return;\n  try {\n    await helpers.httpRequest({ url: cfg.dashboard_url + '/api/hunt/progress', method: 'POST', headers: { 'X-Ingestion-Key': KEY() }, body: { runId: cfg.run_id, ...body }, json: true, timeout: 5000 });\n  } catch (e) {}\n}\n\n  // Today's trend hunt only: the 5 best \"leather jacket\" topics from Google Trends,\n  // each searched on Google Shopping, first 10 leather jackets per topic.\n  // Google Shopping results come from Serper.dev.\n  const c = $('Hunt Config').first().json;\n  if (c.mode !== 'trend') return [];\n  if (!c.serper_key) throw new Error('Today\\'s trend hunt needs a Serper key - add it in Hunt settings');\n  let topics = [];\n  try { topics = $('Google Trends').first().json.topics || []; } catch (e) {}\n  if (!topics.length) topics = ['leather jacket'];\n  const PER_TOPIC = 10;\n  const helpers = this.helpers;\n  const started = Date.now();\n  const out = [];\n  const notes = [];\n  const priceNum = v => { const n = typeof v === 'number' ? v : Number(String(v || '').replace(/[^0-9.]/g, '')); return Number.isFinite(n) && n > 0 ? n : null; };\n\n  // Each provider returns results in one shape: { title, link, price, store, images, rating, reviews, id, snippet }\n  const providers = [];\n  if (c.serper_key) providers.push({ name: 'Serper', async search(q) {\n    const d = await helpers.httpRequest({ url: 'https://google.serper.dev/shopping', method: 'POST', headers: { 'X-API-KEY': c.serper_key, 'Content-Type': 'application/json' }, body: { q, gl: 'us', hl: 'en', num: 40 }, json: true, timeout: 20000 });\n    if (d.message && !d.shopping) throw new Error(d.message);\n    return (d.shopping || []).map(r => ({ title: r.title, link: r.link, price: priceNum(r.price), store: r.source,\n      images: [r.imageUrl], rating: r.rating, reviews: r.ratingCount, id: r.productId, snippet: r.delivery || '' }));\n  } });\n\n  for (const topic of topics.slice(0, 5)) {\n    if (Date.now() - started > 45000) { notes.push('time limit reached'); break; }\n    let results = null;\n    for (const p of providers) {\n      if (p.out) continue;\n      try { results = await p.search(topic); notes.push(`${topic}: ${p.name}`); break; }\n      catch (e) {\n        const msg = String(e.message || e);\n        notes.push(`${topic}: ${p.name} failed (${msg.slice(0, 120)})`);\n        // out of searches / bad key / rate limited: don't try this provider again this run\n        if (/run out|limit|quota|credits|401|403|429|invalid api key|unauthor/i.test(msg)) p.out = true;\n      }\n    }\n    if (!results) continue;\n    let kept = 0;\n    results.forEach((r, i) => {\n      if (kept >= PER_TOPIC) return;\n      const name = String(r.title || '').trim();\n      if (!name || !r.link) return;\n      if (!isLeatherJacket(name, c.allow_faux)) return;\n      if (!inPriceRange(r.price, c)) return;\n      const images = httpsImages(r.images);\n      if (!images.length) return;\n      kept++;\n      out.push({ json: {\n        source: 'google_shopping',\n        marketplace: 'Google Shopping',\n        source_domain: String(r.store || ''),\n        product_id: String(r.productId || r.id || r.link),\n        product_name: name,\n        product_link: r.link,\n        source_price: r.price,\n        source_currency: 'USD',\n        image_urls: images,\n        seller_name: String(r.store || ''),\n        rating: Number(r.rating) || null,\n        review_count: Number(r.reviews) || null,\n        search_rank: kept,\n        search_query: topic,\n        trend_topic: topic,\n        market: 'US',\n        description: r.snippet || '',\n        raw_details: { tags: ['Google Trends: ' + topic], localizedAspects: [{ name: 'Trending topic', value: topic }, ...(r.delivery ? [{ name: 'Delivery', value: String(r.delivery) }] : [])] }\n      } });\n    });\n    if (!kept) notes.push(`${topic}: no leather jackets in the price range`);\n  }\n  await report(helpers, c, { step: 'Google Shopping', status: out.length ? 'done' : 'error', count: out.length,\n    detail: out.length ? `${out.length} jackets from ${new Set(out.map(o => o.json.trend_topic)).size} topics` : 'No Google Shopping jackets found · ' + notes.slice(0, 3).join(' · ') });\n  if (!out.length) out.push({ json: { kind: 'notice', origin: 'Google Shopping', requests: notes, reason: 'No Google Shopping jackets found' } });\n  return out;\n"
+      },
+      "id": "571a583a-ff3a-4e3e-bfc8-76bfb2f69b2b",
+      "name": "Google Shopping",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        600
+      ],
+      "alwaysOutputData": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.ebay.com/identity/v1/oauth2/token",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "scope",
+              "value": "https://api.ebay.com/oauth/api_scope"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d4e8b891-d7b4-496a-aa2c-7d4a0009a229",
+      "name": "eBay OAuth Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        672,
+        0
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "name": "Ebay"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "  const c = $('Hunt Config').first().json;\n  if (!c.sources.includes('ebay')) return [];\n  const token = $input.first().json.access_token;\n  if (!token) throw new Error('eBay OAuth token missing - check the Ebay credential');\n\n  const currency = { US: 'USD', UK: 'GBP', CA: 'CAD' };\n  const geo = { US: 'US', UK: 'GB', CA: 'CA' };\n  const marketplaceId = { US: 'EBAY_US', UK: 'EBAY_GB', CA: 'EBAY_CA' };\n  const out = [];\n\n  for (const market of c.markets) {\n    for (const keyword of c.keywords) {\n      out.push({ json: {\n        query: keyword,\n        market,\n        geo: geo[market],\n        currency: currency[market],\n        marketplace_id: marketplaceId[market],\n        // Price range is applied natively by eBay in the market's own currency\n        filter: `price:[${c.min_price}..${c.max_price}],priceCurrency:${currency[market]},deliveryCountry:${geo[market]}`,\n        limit: c.per_query_limit,\n        access_token: token\n      }});\n    }\n  }\n  return out;\n"
+      },
+      "id": "7e2f29fc-b655-4bb9-b963-56d02b7dd78b",
+      "name": "eBay Query Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://api.ebay.com/buy/browse/v1/item_summary/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.query }}"
+            },
+            {
+              "name": "limit",
+              "value": "={{ $json.limit }}"
+            },
+            {
+              "name": "filter",
+              "value": "={{ $json.filter }}"
+            },
+            {
+              "name": "fieldgroups",
+              "value": "EXTENDED"
+            },
+            {
+              "name": "sort",
+              "value": "newlyListed"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.access_token }}"
+            },
+            {
+              "name": "X-EBAY-C-MARKETPLACE-ID",
+              "value": "={{ $json.marketplace_id }}"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 4,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "0011caae-eb75-4d67-b59c-bd02f8fec6a5",
+      "name": "eBay Leather Jacket Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1120,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1500,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function isLeatherJacket(text, allowFaux) {\n  const t = String(text || '').toLowerCase().replace(/%20|[-_/+]+/g, ' ');\n  if (!/\\bleather\\b|\\bsuede\\b|\\bshearling\\b|\\bnappa\\b|\\blambskin\\b|\\bcowhide\\b/.test(t)) return false;\n  if (!/\\b(jacket|jackets|bomber|biker|moto|motorcycle|racer|trucker|aviator|blouson|shacket)\\b/.test(t)) return false;\n  // other products that mention leather jackets (a jacket \"with belt\", a \"shirt jacket\" or \"wool lining\" still counts)\n  if (/\\b(vest|waistcoat|gilet|pants|trousers|skirt|chaps|pattern|pdf|patch|patches|sticker|keychain|keyring|key ring|wallet|bag|purse|gloves|boots|shoes|hanger|cleaner|conditioner|toy|doll|barbie|dog|helmet|lot of|bundle|phone case|case for|earring|earrings|necklace|magnet|ornament|miniature)\\b/.test(t)) return false;\n  if (/\\b(overcoat|trench|duster|parka|peacoat|tuxedo|suit|suits|turtleneck|sweater|hoodie only)\\b/.test(t)) return false;\n  if (/\\b(coat|coats)\\b/.test(t) && !/\\bjackets?\\b/.test(t)) return false;\n  if (!allowFaux && /\\b(faux|vegan|pu leather|pleather|leatherette|imitation|synthetic leather)\\b/.test(t)) return false;\n  return true;\n}\n\nfunction inPriceRange(price, cfg) {\n  const p = Number(price);\n  if (!Number.isFinite(p) || p <= 0) return cfg.include_unpriced === true;\n  return p >= cfg.min_price && p <= cfg.max_price;\n}\n\nfunction httpsImages(values) {\n  return [...new Set(values.flat(Infinity).map(v => typeof v === 'string' ? v : (v && (v.imageUrl || v.url_fullxfull || v.url_570xN || v.contentUrl || v.url || v.src)) || '')\n    .map(v => String(v || '').trim().replace(/&amp;/g, '&').replace(/^\\/\\//, 'https://').replace(/^http:\\/\\//i, 'https://'))\n    .filter(v => /^https:\\/\\//i.test(v))\n    .filter(v => !/\\.(gif|svg)(\\?|$)/i.test(v))\n    .filter(v => !/(placeholder|no[-_ ]?image|logo|favicon|sprite|icon|avatar|pixel|size[-_ ]?chart|payment|badge)/i.test(v)))];\n}\n\n  const c = $('Hunt Config').first().json;\n  const queries = $('eBay Query Builder').all();\n  const seen = new Set();\n  const out = [];\n\n  $input.all().forEach((item, i) => {\n    const ctx = queries[item.pairedItem?.item ?? i]?.json || {};\n    const list = Array.isArray(item.json.itemSummaries) ? item.json.itemSummaries : [];\n\n    list.forEach((s, index) => {\n      const id = String(s.legacyItemId || s.itemId || '');\n      if (!id || seen.has(id)) return;\n      if (!isLeatherJacket(s.title, c.allow_faux)) return;\n      const price = Number(s.price?.value);\n      if (!inPriceRange(price, c)) return;\n      seen.add(id);\n\n      out.push({ json: {\n        source: 'ebay',\n        marketplace: 'eBay',\n        source_domain: 'ebay.com',\n        product_id: id,\n        item_id: s.itemId,\n        product_name: s.title,\n        product_link: String(s.itemWebUrl || '').split('?')[0],\n        source_price: Number.isFinite(price) ? price : null,\n        source_currency: s.price?.currency || ctx.currency || 'USD',\n        image_urls: httpsImages([s.image || {}, s.additionalImages || [], s.thumbnailImages || []]),\n        description: s.shortDescription || '',\n        condition: s.condition || '',\n        seller_name: s.seller?.username || '',\n        seller_feedback: Number(s.seller?.feedbackPercentage || 0),\n        seller_feedback_score: Number(s.seller?.feedbackScore || 0),\n        market: ctx.market || 'US',\n        marketplace_id: ctx.marketplace_id || 'EBAY_US',\n        search_query: ctx.query || '',\n        search_rank: index + 1,\n        raw_details: {\n          itemId: s.itemId,\n          legacyItemId: s.legacyItemId,\n          buyingOptions: s.buyingOptions || [],\n          categories: s.categories || [],\n          itemLocation: s.itemLocation || {},\n          shippingOptions: s.shippingOptions || [],\n          itemCreationDate: s.itemCreationDate || null\n        }\n      }});\n    });\n  });\n  return out;\n"
+      },
+      "id": "51226e50-8969-41c3-ada1-f87a4da366c0",
+      "name": "eBay Search Extractor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.ebay.com/buy/browse/v1/item/' + encodeURIComponent($json.item_id) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('eBay OAuth Token').first().json.access_token }}"
+            },
+            {
+              "name": "X-EBAY-C-MARKETPLACE-ID",
+              "value": "={{ $json.marketplace_id || 'EBAY_US' }}"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 400
+            }
+          }
+        }
+      },
+      "id": "c8ec4eaf-6d46-4de0-b31d-00c57e735425",
+      "name": "Fetch eBay Item Details",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1568,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1500,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function httpsImages(values) {\n  return [...new Set(values.flat(Infinity).map(v => typeof v === 'string' ? v : (v && (v.imageUrl || v.url_fullxfull || v.url_570xN || v.contentUrl || v.url || v.src)) || '')\n    .map(v => String(v || '').trim().replace(/&amp;/g, '&').replace(/^\\/\\//, 'https://').replace(/^http:\\/\\//i, 'https://'))\n    .filter(v => /^https:\\/\\//i.test(v))\n    .filter(v => !/\\.(gif|svg)(\\?|$)/i.test(v))\n    .filter(v => !/(placeholder|no[-_ ]?image|logo|favicon|sprite|icon|avatar|pixel|size[-_ ]?chart|payment|badge)/i.test(v)))];\n}\n\n  // Merges full eBay item details (all images, aspects, description) back onto each product\n  const base = $('eBay Search Extractor').all();\n  const strip = html => String(html || '').replace(/<style[\\s\\S]*?<\\/style>|<script[\\s\\S]*?<\\/script>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\\s+/g, ' ').trim().slice(0, 5000);\n\n  return $input.all().map((item, i) => {\n    const p = base[item.pairedItem?.item ?? i]?.json || {};\n    const d = item.json || {};\n    if (!d.itemId) return { json: { ...p, listed_at: p.raw_details?.itemCreationDate || null, ebay_detail_status: 'search_summary_only' } };\n\n    const seller = d.seller || {};\n    const review = d.primaryProductReviewRating || {};\n    return { json: {\n      ...p,\n      product_name: d.title || p.product_name,\n      description: d.shortDescription || strip(d.description) || p.description,\n      condition: d.condition || p.condition,\n      brand: d.brand || (d.localizedAspects || []).find(a => /^brand$/i.test(a.name))?.value || '',\n      image_urls: httpsImages([d.image || {}, d.additionalImages || [], p.image_urls || []]).slice(0, 24),\n      seller_name: seller.username || p.seller_name,\n      seller_feedback: Number(seller.feedbackPercentage || p.seller_feedback || 0),\n      seller_feedback_score: Number(seller.feedbackScore || p.seller_feedback_score || 0),\n      rating: Number(review.averageRating || 0) || (Number(seller.feedbackPercentage || 0) / 20),\n      review_count: Number(review.reviewCount || 0) || Number(seller.feedbackScore || 0),\n      raw_details: {\n        ...p.raw_details,\n        seller,\n        conditionDescription: d.conditionDescription || '',\n        localizedAspects: d.localizedAspects || [],\n        itemLocation: d.itemLocation || p.raw_details?.itemLocation || {},\n        shippingOptions: d.shippingOptions || p.raw_details?.shippingOptions || [],\n        returnTerms: d.returnTerms || {},\n        itemEndDate: d.itemEndDate || null,\n        primaryProductReviewRating: review,\n        estimatedSoldQuantity: Number((d.estimatedAvailabilities || [])[0]?.estimatedSoldQuantity || 0)\n      },\n      listed_at: d.itemCreationDate || p.raw_details?.itemCreationDate || null,\n      ebay_detail_status: 'completed'\n    }};\n  });\n"
+      },
+      "id": "83b1d22b-a16e-4595-a985-40f31c982ed4",
+      "name": "eBay Detail Merger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ingestion key arrives with the hunt request (checked by \"Authorized Leather Hunt?\"); it is not written in the nodes.\nconst KEY = () => (($('Leather Hunt Webhook').first().json || {}).headers || {})['x-ingestion-key'] || '';\n// Was this hunt stopped (or timed out) in the dashboard? Then every step quits straight away.\nasync function shouldStop(helpers) {\n  try {\n    const c = $('Hunt Config').first().json;\n    if (!c.run_id) return false;\n    const r = await helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/state?runId=' + encodeURIComponent(c.run_id), method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 5000 });\n    return !!(r && r.stop);\n  } catch (e) { return false; }\n}\nconst c = $('Hunt Config').first().json;\nconst items = $input.all().filter(i => i.json && i.json.product_name);\ntry {\n  await this.helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/progress', method: 'POST', headers: { 'X-Ingestion-Key': KEY() },\n    body: { runId: c.run_id, step: 'eBay', status: 'done', count: items.length, detail: items.length + ' leather jackets in your price range' }, json: true, timeout: 5000 });\n} catch (e) {}\nreturn $input.all();"
+      },
+      "id": "e8bb634a-1c59-47d6-b551-97c7e4c0960d",
+      "name": "Report eBay",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1904,
+        -100
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "  const c = $('Hunt Config').first().json;\n  if (!c.sources.includes('etsy')) return [];\n  const geo = { US: 'US', UK: 'GB', CA: 'CA' };\n  return c.keywords.map((keyword, i) => ({ json: {\n    query: keyword,\n    market: c.markets[i % c.markets.length],\n    geo: geo[c.markets[i % c.markets.length]],\n    min_price: c.min_price,\n    max_price: c.max_price,\n    limit: c.per_query_limit\n  }}));\n"
+      },
+      "id": "935359bd-cd8e-4963-b2e9-5dea1b9b5a88",
+      "name": "Etsy Query Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://api.etsy.com/v3/application/listings/active",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "keywords",
+              "value": "={{ $json.query }}"
+            },
+            {
+              "name": "min_price",
+              "value": "={{ $json.min_price }}"
+            },
+            {
+              "name": "max_price",
+              "value": "={{ $json.max_price }}"
+            },
+            {
+              "name": "sort_on",
+              "value": "created"
+            },
+            {
+              "name": "sort_order",
+              "value": "desc"
+            },
+            {
+              "name": "limit",
+              "value": "={{ $json.limit }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 3,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "8bb4f2db-76a8-4ba6-bd4e-6084916409b3",
+      "name": "Etsy Leather Jacket Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        896,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Etsy"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1500,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function isLeatherJacket(text, allowFaux) {\n  const t = String(text || '').toLowerCase().replace(/%20|[-_/+]+/g, ' ');\n  if (!/\\bleather\\b|\\bsuede\\b|\\bshearling\\b|\\bnappa\\b|\\blambskin\\b|\\bcowhide\\b/.test(t)) return false;\n  if (!/\\b(jacket|jackets|bomber|biker|moto|motorcycle|racer|trucker|aviator|blouson|shacket)\\b/.test(t)) return false;\n  // other products that mention leather jackets (a jacket \"with belt\", a \"shirt jacket\" or \"wool lining\" still counts)\n  if (/\\b(vest|waistcoat|gilet|pants|trousers|skirt|chaps|pattern|pdf|patch|patches|sticker|keychain|keyring|key ring|wallet|bag|purse|gloves|boots|shoes|hanger|cleaner|conditioner|toy|doll|barbie|dog|helmet|lot of|bundle|phone case|case for|earring|earrings|necklace|magnet|ornament|miniature)\\b/.test(t)) return false;\n  if (/\\b(overcoat|trench|duster|parka|peacoat|tuxedo|suit|suits|turtleneck|sweater|hoodie only)\\b/.test(t)) return false;\n  if (/\\b(coat|coats)\\b/.test(t) && !/\\bjackets?\\b/.test(t)) return false;\n  if (!allowFaux && /\\b(faux|vegan|pu leather|pleather|leatherette|imitation|synthetic leather)\\b/.test(t)) return false;\n  return true;\n}\n\nfunction inPriceRange(price, cfg) {\n  const p = Number(price);\n  if (!Number.isFinite(p) || p <= 0) return cfg.include_unpriced === true;\n  return p >= cfg.min_price && p <= cfg.max_price;\n}\n\n  const c = $('Hunt Config').first().json;\n  const queries = $('Etsy Query Builder').all();\n  const seen = new Set();\n  const out = [];\n\n  $input.all().forEach((item, i) => {\n    const ctx = queries[item.pairedItem?.item ?? i]?.json || {};\n    const list = Array.isArray(item.json.results) ? item.json.results : [];\n\n    list.forEach((l, index) => {\n      const id = String(l.listing_id || '');\n      if (!id || seen.has(id)) return;\n      if (!isLeatherJacket(l.title + ' ' + (l.tags || []).join(' '), c.allow_faux) || !isLeatherJacket(l.title + ' leather', c.allow_faux)) return;\n      const price = l.price?.amount !== undefined ? Number(l.price.amount) / Number(l.price.divisor || 100) : Number(l.price);\n      if (!inPriceRange(price, c)) return;\n      seen.add(id);\n\n      out.push({ json: {\n        source: 'etsy',\n        marketplace: 'Etsy',\n        source_domain: 'etsy.com',\n        product_id: id,\n        product_name: String(l.title || '').replace(/&#39;/g, \"'\").replace(/&quot;/g, '\"').replace(/&amp;/g, '&'),\n        product_link: String(l.url || `https://www.etsy.com/listing/${id}`).split('?')[0],\n        source_price: Number.isFinite(price) ? price : null,\n        source_currency: l.price?.currency_code || 'USD',\n        image_urls: [],\n        description: String(l.description || '').slice(0, 5000),\n        condition: l.when_made && /before|19|200/.test(l.when_made) ? 'Vintage' : 'New',\n        market: ctx.market || 'US',\n        search_query: ctx.query || '',\n        search_rank: index + 1,\n        raw_details: {\n          listing_id: l.listing_id,\n          shop_id: l.shop_id,\n          tags: l.tags || [],\n          materials: l.materials || [],\n          taxonomy_id: l.taxonomy_id || null,\n          views: l.views ?? null,\n          num_favorers: l.num_favorers ?? null,\n          when_made: l.when_made || null,\n          creation_timestamp: l.creation_timestamp ?? null,\n          original_creation_timestamp: l.original_creation_timestamp ?? null\n        }\n      }});\n    });\n  });\n  return out;\n"
+      },
+      "id": "560f48ba-fdc2-4cd4-8ed4-51093a19416f",
+      "name": "Etsy Search Extractor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "  const ids = $input.all().map(i => i.json.product_id).filter(Boolean);\n  const batches = [];\n  for (let i = 0; i < ids.length; i += 100) batches.push({ json: { listing_ids: ids.slice(i, i + 100).join(',') } });\n  return batches;\n"
+      },
+      "id": "0af38e00-bdfc-4412-9195-ba3ec06a44de",
+      "name": "Etsy Batch Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://api.etsy.com/v3/application/listings/batch",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "listing_ids",
+              "value": "={{ $json.listing_ids }}"
+            },
+            {
+              "name": "includes",
+              "value": "Images,Shop"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d05c7393-9c23-4ca5-b0b2-a7feaed2bab1",
+      "name": "Fetch Etsy Listing Details",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1568,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Etsy"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1500,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function httpsImages(values) {\n  return [...new Set(values.flat(Infinity).map(v => typeof v === 'string' ? v : (v && (v.imageUrl || v.url_fullxfull || v.url_570xN || v.contentUrl || v.url || v.src)) || '')\n    .map(v => String(v || '').trim().replace(/&amp;/g, '&').replace(/^\\/\\//, 'https://').replace(/^http:\\/\\//i, 'https://'))\n    .filter(v => /^https:\\/\\//i.test(v))\n    .filter(v => !/\\.(gif|svg)(\\?|$)/i.test(v))\n    .filter(v => !/(placeholder|no[-_ ]?image|logo|favicon|sprite|icon|avatar|pixel|size[-_ ]?chart|payment|badge)/i.test(v)))];\n}\n\n  // Attaches the full Etsy image gallery and shop info to each listing\n  const details = new Map();\n  for (const item of $input.all()) {\n    for (const l of item.json.results || []) details.set(String(l.listing_id), l);\n  }\n\n  return $('Etsy Search Extractor').all().map(({ json: p }) => {\n    const d = details.get(p.product_id) || {};\n    const images = (d.images || []).slice().sort((a, b) => Number(a.rank || 0) - Number(b.rank || 0));\n    const shop = d.shop || {};\n    return { json: {\n      ...p,\n      image_urls: httpsImages([images.map(img => img.url_fullxfull || img.url_570xN), p.image_urls]).slice(0, 24),\n      seller_name: shop.shop_name || String(p.raw_details?.shop_id || ''),\n      rating: Number(shop.review_average || 0),\n      review_count: Number(shop.review_count || 0),\n      raw_details: {\n        ...p.raw_details,\n        shop: {\n          shopId: shop.shop_id || p.raw_details?.shop_id || null,\n          shopName: shop.shop_name || '',\n          reviewAverage: Number(shop.review_average || 0),\n          reviewCount: Number(shop.review_count || 0),\n          transactionSoldCount: Number(shop.transaction_sold_count || 0),\n          country: shop.shop_location_country_iso || ''\n        }\n      },\n      etsy_detail_status: d.listing_id ? 'completed' : 'search_summary_only'\n    }};\n  });\n"
+      },
+      "id": "316c36ff-6a9b-41f8-9084-a424f19ed84a",
+      "name": "Etsy Detail Merger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ingestion key arrives with the hunt request (checked by \"Authorized Leather Hunt?\"); it is not written in the nodes.\nconst KEY = () => (($('Leather Hunt Webhook').first().json || {}).headers || {})['x-ingestion-key'] || '';\n// Was this hunt stopped (or timed out) in the dashboard? Then every step quits straight away.\nasync function shouldStop(helpers) {\n  try {\n    const c = $('Hunt Config').first().json;\n    if (!c.run_id) return false;\n    const r = await helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/state?runId=' + encodeURIComponent(c.run_id), method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 5000 });\n    return !!(r && r.stop);\n  } catch (e) { return false; }\n}\nconst c = $('Hunt Config').first().json;\nconst items = $input.all().filter(i => i.json && i.json.product_name);\ntry {\n  await this.helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/progress', method: 'POST', headers: { 'X-Ingestion-Key': KEY() },\n    body: { runId: c.run_id, step: 'Etsy', status: 'done', count: items.length, detail: items.length + ' leather jackets in your price range' }, json: true, timeout: 5000 });\n} catch (e) {}\nreturn $input.all();"
+      },
+      "id": "710cae30-ffd5-4aeb-99fd-cc9f63144ed2",
+      "name": "Report Etsy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1904,
+        100
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "  const c = $('Hunt Config').first().json;\n  if (!c.sources.includes('websites')) return [];\n  if (!c.websites.length) return []; // nothing to read: eBay / Etsy still run\n  return c.websites.map(origin => ({ json: { origin } }));\n"
+      },
+      "id": "65a40d29-aa35-4413-9087-ac7e01c67752",
+      "name": "Website List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        400
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "e03b951d-f421-4038-be90-3e840cec7006",
+      "name": "Loop Over Websites",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        896,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ingestion key arrives with the hunt request (checked by \"Authorized Leather Hunt?\"); it is not written in the nodes.\nconst KEY = () => (($('Leather Hunt Webhook').first().json || {}).headers || {})['x-ingestion-key'] || '';\n// Was this hunt stopped (or timed out) in the dashboard? Then every step quits straight away.\nasync function shouldStop(helpers) {\n  try {\n    const c = $('Hunt Config').first().json;\n    if (!c.run_id) return false;\n    const r = await helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/state?runId=' + encodeURIComponent(c.run_id), method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 5000 });\n    return !!(r && r.stop);\n  } catch (e) { return false; }\n}\nfunction inPriceRange(price, cfg) {\n  const p = Number(price);\n  if (!Number.isFinite(p) || p <= 0) return cfg.include_unpriced === true;\n  return p >= cfg.min_price && p <= cfg.max_price;\n}\n\nfunction httpsImages(values) {\n  return [...new Set(values.flat(Infinity).map(v => typeof v === 'string' ? v : (v && (v.imageUrl || v.url_fullxfull || v.url_570xN || v.contentUrl || v.url || v.src)) || '')\n    .map(v => String(v || '').trim().replace(/&amp;/g, '&').replace(/^\\/\\//, 'https://').replace(/^http:\\/\\//i, 'https://'))\n    .filter(v => /^https:\\/\\//i.test(v))\n    .filter(v => !/\\.(gif|svg)(\\?|$)/i.test(v))\n    .filter(v => !/(placeholder|no[-_ ]?image|logo|favicon|sprite|icon|avatar|pixel|size[-_ ]?chart|payment|badge)/i.test(v)))];\n}\n\nfunction sha256(input) {\n  // Pure JS SHA-256 (n8n blocks require('crypto') by default)\n  const bytes = unescape(encodeURIComponent(String(input)));\n  const K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];\n  const H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];\n  const l = bytes.length;\n  const words = [];\n  for (let i = 0; i < l; i++) words[i >> 2] |= bytes.charCodeAt(i) << (24 - (i % 4) * 8);\n  words[l >> 2] |= 0x80 << (24 - (l % 4) * 8);\n  words[(((l + 8) >> 6) + 1) * 16 - 1] = l * 8;\n  const r = (x, n) => (x >>> n) | (x << (32 - n));\n  for (let j = 0; j < words.length; j += 16) {\n    const w = Array.from({ length: 16 }, (_, k) => words[j + k] | 0);\n    let [a, b, c, d, e, f, g, h] = H;\n    for (let i = 0; i < 64; i++) {\n      if (i >= 16) {\n        const s0 = r(w[i - 15], 7) ^ r(w[i - 15], 18) ^ (w[i - 15] >>> 3);\n        const s1 = r(w[i - 2], 17) ^ r(w[i - 2], 19) ^ (w[i - 2] >>> 10);\n        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;\n      }\n      const t1 = (h + (r(e, 6) ^ r(e, 11) ^ r(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;\n      const t2 = ((r(a, 2) ^ r(a, 13) ^ r(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;\n      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;\n    }\n    H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;\n    H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;\n  }\n  return H.map(x => (x >>> 0).toString(16).padStart(8, '0')).join('');\n}\n\nfunction urlParts(value) {\n  // n8n Code nodes have no URL class, so split URLs by hand\n  const m = String(value || '').trim().match(/^(https?):\\/\\/([^\\/?#:]+)(:\\d+)?([^?#]*)/i);\n  if (!m) return null;\n  const host = m[2].toLowerCase();\n  return { origin: m[1].toLowerCase() + '://' + host + (m[3] || ''), host, pathname: m[4] || '/' };\n}\n\nfunction makeGet(helpers, deadline = Date.now() + 50000) {\n  // Fetch with block detection. n8n Code nodes are limited to 60s, so timeouts stay short.\n  const BLOCK = /sgcaptcha|challenge-platform|cf-chl|cf_chl|sucuri_cloudproxy|Just a moment\\.\\.\\.|Attention Required/i;\n  const blockName = t => /sgcaptcha/i.test(t) ? 'SiteGround CAPTCHA' : /sucuri/i.test(t) ? 'Sucuri firewall' : 'Cloudflare challenge';\n  const wait = ms => new Promise(r => setTimeout(r, ms));\n  const log = [];\n  const note = (url, result) => { log.push(url.replace(/^https?:\\/\\/[^\\/]+/, '') + ' -> ' + result); return log.length; };\n  async function get(url, json = false, timeout = 12000) {\n    for (let attempt = 0; attempt < 2; attempt++) {\n      // never run past n8n's 60 s limit: shorter timeout near the end, nothing new when time is up\n      const left = deadline - Date.now();\n      if (left < 3000) return { status: 0, skipped: 'out of time' };\n      timeout = Math.min(timeout, left - 1500);\n      try {\n        // Plain request, same as n8n's HTTP Request node (no browser User-Agent)\n        const res = await helpers.httpRequest({ url, method: 'GET', timeout });\n        const text = typeof res === 'string' ? res : (Buffer.isBuffer(res) ? res.toString('utf8') : null);\n        if (text && BLOCK.test(text.slice(0, 4000))) { note(url, 'blocked: ' + blockName(text)); return { blocked: blockName(text) }; }\n        note(url, 'ok ' + (text !== null ? text.length + ' chars' + (/<urlset|<sitemapindex/i.test(text.slice(0, 600)) ? ' (sitemap)' : /^\\s*[\\[{]/.test(text) ? ' (json)' : /<html/i.test(text.slice(0, 600)) ? ' (html)' : '') : 'object'));\n        if (json) {\n          if (text === null) return { data: res };\n          try { return { data: JSON.parse(text) }; } catch { return {}; }\n        }\n        return { text: text !== null ? text : JSON.stringify(res) };\n      } catch (e) {\n        const status = Number(e.httpCode || e.statusCode || e.response?.status || e.cause?.response?.status || e.cause?.status || (String(e.message || '').match(/status code (\\d{3})/) || [])[1] || 0);\n        const body = String(e.response?.body || e.response?.data || e.cause?.response?.data || e.description || '');\n        note(url, (status ? 'HTTP ' + status : 'error') + ' ' + String(e.message || '').slice(0, 80));\n        if (BLOCK.test(body.slice(0, 4000))) return { blocked: blockName(body) };\n        if (status === 403 && attempt === 1) return { blocked: 'HTTP 403 Forbidden (firewall)' };\n        if (attempt === 0 && [403, 429, 503].includes(status) && deadline - Date.now() > 15000) { await wait(3000); continue; }\n        return { status };\n      }\n    }\n    return {};\n  }\n  get.log = log;\n  return get;\n}\n\nfunction decodeHtml(s) {\n  return String(s || '').replace(/&amp;/g, '&').replace(/&#39;|&#039;|&#8217;/g, \"'\").replace(/&quot;/g, '\"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&#8211;/g, '-').trim();\n}\n\nfunction stripHtml(html) {\n  return decodeHtml(String(html || '').replace(/<style[\\s\\S]*?<\\/style>|<script[\\s\\S]*?<\\/script>/gi, ' ').replace(/<br\\s*\\/?>|<\\/p>|<\\/li>/gi, '\\n').replace(/<[^>]+>/g, ' ')).replace(/[ \\t]+/g, ' ').replace(/\\n\\s*\\n+/g, '\\n').trim().slice(0, 6000);\n}\n\nfunction canonicalUrl(url) {\n  // lowercase host, no www, no query/hash, no trailing slash, no /collections/x/ prefix\n  const u = urlParts(url);\n  if (!u) return String(url).toLowerCase();\n  const path = u.pathname.replace(/\\/collections\\/[^/]+(?=\\/products\\/)/i, '').replace(/\\/+$/, '').toLowerCase();\n  return u.host.replace(/^www\\./, '') + path;\n}\n\nfunction siteBase(origin) {\n  const domain = urlParts(origin).host.replace(/^www\\./, '');\n  return { source: 'website', marketplace: 'Website', source_domain: domain, seller_name: domain, market: '', search_query: 'full catalog', condition: 'New' };\n}\n\nfunction isLeatherJacket(text, allowFaux) {\n  const t = String(text || '').toLowerCase().replace(/%20|[-_/+]+/g, ' ');\n  if (!/\\bleather\\b|\\bsuede\\b|\\bshearling\\b|\\bnappa\\b|\\blambskin\\b|\\bcowhide\\b/.test(t)) return false;\n  if (!/\\b(jacket|jackets|bomber|biker|moto|motorcycle|racer|trucker|aviator|blouson|shacket)\\b/.test(t)) return false;\n  // other products that mention leather jackets (a jacket \"with belt\", a \"shirt jacket\" or \"wool lining\" still counts)\n  if (/\\b(vest|waistcoat|gilet|pants|trousers|skirt|chaps|pattern|pdf|patch|patches|sticker|keychain|keyring|key ring|wallet|bag|purse|gloves|boots|shoes|hanger|cleaner|conditioner|toy|doll|barbie|dog|helmet|lot of|bundle|phone case|case for|earring|earrings|necklace|magnet|ornament|miniature)\\b/.test(t)) return false;\n  if (/\\b(overcoat|trench|duster|parka|peacoat|tuxedo|suit|suits|turtleneck|sweater|hoodie only)\\b/.test(t)) return false;\n  if (/\\b(coat|coats)\\b/.test(t) && !/\\bjackets?\\b/.test(t)) return false;\n  if (!allowFaux && /\\b(faux|vegan|pu leather|pleather|leatherette|imitation|synthetic leather)\\b/.test(t)) return false;\n  return true;\n}\n\nasync function report(helpers, cfg, body) {\n  // Tells the dashboard how the hunt is going. Never stops the hunt if the dashboard can't be reached.\n  if (!cfg || !cfg.run_id || !cfg.dashboard_url) return;\n  try {\n    await helpers.httpRequest({ url: cfg.dashboard_url + '/api/hunt/progress', method: 'POST', headers: { 'X-Ingestion-Key': KEY() }, body: { runId: cfg.run_id, ...body }, json: true, timeout: 5000 });\n  } catch (e) {}\n}\n\n  // One site per run (Loop Over Websites). Finds the store's BEST SELLERS and its NEWEST products.\n  // Shopify / WooCommerce feeds give finished products; other sites give product page URLs for the scrape loop.\n  const c = $('Hunt Config').first().json;\n  const origin = $input.first().json.origin;\n  if (await shouldStop(this.helpers)) return [];\n  const get = makeGet(this.helpers, Date.now() + 52000);\n  const started = Date.now();\n  const timeLeft = () => Date.now() - started < 48000;\n  const base = siteBase(origin);\n  const out = [];\n  const seen = new Set();\n  let blocked = '';\n  const BEST = /best[-_ ]?sell|bestseller|top[-_ ]?sell|top[-_ ]?rated|most[-_ ]?popular|popular|trending|featured/i;\n\n  function addProduct(p) {\n    if (!p.product_name || !p.product_link || !inPriceRange(p.source_price, c)) return;\n    if (!isLeatherJacket(p.product_name, c.allow_faux)) return;\n    p.image_urls = httpsImages([p.image_urls]).slice(0, 30);\n    if (!p.image_urls.length) return;\n    const hash = sha256(canonicalUrl(p.product_link));\n    if (seen.has(hash)) return;\n    seen.add(hash);\n    out.push({ ...base, ...p, kind: 'product', product_id: hash, url_hash: hash });\n  }\n\n  // 0) Homepage first: tells us the platform, so we don't waste time on APIs the site doesn't have\n  const homePage = await get(origin + '/');\n  if (homePage.blocked) blocked = homePage.blocked;\n  const homeHtml = String(homePage.text || '');\n  let isShopify = /cdn\\.shopify\\.com|Shopify\\.theme|myshopify\\.com/i.test(homeHtml);\n  let firstShopifyPage = null;\n  if (isShopify && !blocked) {\n    firstShopifyPage = await get(`${origin}/products.json?limit=250&page=1`, true);\n    if (firstShopifyPage.blocked) blocked = firstShopifyPage.blocked;\n    if (!Array.isArray(firstShopifyPage.data?.products)) isShopify = false;\n  }\n  const isWoo = /wp-content|woocommerce|wp-json/i.test(homeHtml);\n\n  // 1) Shopify: best-seller collection + newest products (products.json is newest first)\n  const shopifyBest = new Set();\n  if (isShopify && !blocked) for (const handle of ['best-sellers', 'bestsellers', 'best-selling', 'best-seller', 'top-sellers', 'popular']) {\n    if (!timeLeft()) break;\n    if (!timeLeft()) break;\n    const r = await get(`${origin}/collections/${handle}/products.json?limit=250`, true);\n    if (r.blocked) { blocked = r.blocked; break; }\n    const list = Array.isArray(r.data?.products) ? r.data.products : [];\n    list.forEach(p => shopifyBest.add(p.handle));\n    if (list.length) break;\n  }\n  for (let page = 1; isShopify && page <= 4 && timeLeft() && !blocked; page++) {\n    const r = page === 1 && firstShopifyPage ? firstShopifyPage : await get(`${origin}/products.json?limit=250&page=${page}`, true);\n    if (r.blocked) { blocked = r.blocked; break; }\n    const list = Array.isArray(r.data?.products) ? r.data.products : null;\n    if (!list || !list.length) break;\n    if (page === 1) {\n      const cart = await get(`${origin}/cart.js`, true);\n      base.currency = cart.data?.currency || 'USD';\n    }\n    for (const sp of list) {\n      const variants = sp.variants || [];\n      const prices = variants.map(v => Number(v.price)).filter(n => Number.isFinite(n) && n > 0);\n      const compare = variants.map(v => Number(v.compare_at_price)).filter(n => Number.isFinite(n) && n > 0);\n      addProduct({\n        product_name: decodeHtml(sp.title),\n        product_link: `${origin}/products/${sp.handle}`,\n        source_price: prices.length ? Math.min(...prices) : null,\n        source_currency: base.currency,\n        image_urls: (sp.images || []).map(i => i.src),\n        description: stripHtml(sp.body_html),\n        brand: decodeHtml(sp.vendor || ''),\n        is_bestseller: shopifyBest.has(sp.handle),\n        listed_at: sp.published_at || sp.created_at || null,\n        raw_details: {\n          platform: 'shopify',\n          sku: variants[0]?.sku || '',\n          availability: variants.some(v => v.available) ? 'InStock' : 'OutOfStock',\n          tags: Array.isArray(sp.tags) ? sp.tags : String(sp.tags || '').split(',').map(t => t.trim()).filter(Boolean),\n          localizedAspects: [\n            ...(sp.options || []).map(o => ({ name: o.name, value: (o.values || []).join(', ') })),\n            ...(sp.product_type ? [{ name: 'Type', value: sp.product_type }] : []),\n            ...(compare.length ? [{ name: 'Compare at price', value: String(Math.max(...compare)) }] : [])\n          ]\n        }\n      });\n    }\n    if (list.length < 250) break;\n  }\n\n  // 2) WooCommerce Store API: most popular + newest\n  if (isWoo && !out.length && !blocked) {\n    const wooBest = new Set();\n    const popular = await get(`${origin}/wp-json/wc/store/v1/products?per_page=30&orderby=popularity&order=desc`, true);\n    if (popular.blocked) blocked = popular.blocked;\n    const lists = [];\n    if (Array.isArray(popular.data)) { popular.data.forEach(p => wooBest.add(p.id)); lists.push(popular.data); }\n    if (!blocked && timeLeft()) {\n      const newest = await get(`${origin}/wp-json/wc/store/v1/products?per_page=100&orderby=date&order=desc`, true);\n      if (Array.isArray(newest.data)) lists.push(newest.data);\n    }\n    for (const wp of lists.flat()) {\n      const pr = wp.prices || {};\n      const price = Number(pr.price) / Math.pow(10, Number(pr.currency_minor_unit ?? 2));\n      addProduct({\n        product_name: decodeHtml(wp.name),\n        product_link: wp.permalink,\n        source_price: Number.isFinite(price) && price > 0 ? price : null,\n        source_currency: pr.currency_code || 'USD',\n        image_urls: (wp.images || []).map(i => i.src),\n        description: stripHtml(wp.description || wp.short_description),\n        brand: (wp.brands || [])[0]?.name || '',\n        rating: Number(wp.average_rating || 0),\n        review_count: Number(wp.review_count || 0),\n        is_bestseller: wooBest.has(wp.id),\n        listed_at: wp.date_created || null,\n        raw_details: {\n          platform: 'woocommerce',\n          sku: wp.sku || '',\n          availability: wp.is_in_stock ? 'InStock' : 'OutOfStock',\n          tags: (wp.tags || []).map(t => decodeHtml(t.name)),\n          localizedAspects: (wp.attributes || []).map(a => ({ name: decodeHtml(a.name), value: (a.terms || []).map(t => decodeHtml(t.name)).join(', ') }))\n        }\n      });\n    }\n  }\n\n  // 3) Other sites: best-seller page(s) from the homepage + newest products from the sitemap (lastmod)\n  if (!out.length && !blocked) {\n    const locs = xml => [...String(xml).matchAll(/<loc>\\s*(?:<!\\[CDATA\\[)?\\s*([^<\\]]+?)\\s*(?:\\]\\]>)?\\s*<\\/loc>/gi)].map(m => decodeHtml(m[1]));\n    const NOT_PRODUCT = /\\/(collections?|category|categories|product-category|tag|tags|pages?|blogs?|news|articles?|author|search|cart|account|checkout|contact|about|faq|policies|policy|wishlist|compare)(\\/|$)|best[-_ ]?sellers?|top[-_ ]?sellers?|new[-_ ]?arrivals?|\\/sale\\/?$/i;\n    const LOOKS_PRODUCT = /\\/(products?|product-page|item|items|p|pd|dp|shop|store|buy|catalog\\/product\\/view)\\/[^/]+|\\/[^/]+\\.html?$|[?&](product_id|route=product\\/product|id_product)=|-p-?\\d+(\\.html)?$|\\/\\d+-[a-z0-9-]+\\.html$/i;\n    const NEW = /new[-_ ]?arrivals?|new[-_ ]?in\\b|just[-_ ]?in|latest|newest/i;\n    const host = urlParts(origin).host;\n    const absolute = href => {\n      const h = decodeHtml(href).trim();\n      if (/^https?:\\/\\//i.test(h)) return h;\n      if (h.startsWith('//')) return 'https:' + h;\n      if (h.startsWith('/')) return origin + h;\n      return '';\n    };\n\n    // Sitemap: product URL -> { images, lastmod }\n    const roots = [];\n    const robots = await get(origin + '/robots.txt');\n    if (robots.blocked) blocked = robots.blocked;\n    if (robots.text) for (const m of robots.text.matchAll(/^\\s*sitemap:\\s*(\\S+)/gim)) roots.push(m[1].trim());\n    if (!roots.length) roots.push(origin + '/sitemap.xml', origin + '/sitemap_index.xml', origin + '/product-sitemap.xml', origin + '/xmlsitemap.php', origin + '/sitemap_products_1.xml', origin + '/wp-sitemap.xml');\n    const queue = [...new Set(roots)].map(url => ({ url, product: /product/i.test(url) }));\n    const visited = new Set();\n    const fromProductMaps = new Map();\n    const fromOtherMaps = new Map();\n    while (queue.length && visited.size < 15 && timeLeft() && !blocked) {\n      const sm = queue.shift();\n      if (visited.has(sm.url) || /\\.gz(\\?|$)/i.test(sm.url)) continue;\n      visited.add(sm.url);\n      const r = await get(sm.url);\n      if (r.blocked) { blocked = r.blocked; break; }\n      const xml = r.text || '';\n      if (/<sitemapindex/i.test(xml)) {\n        const children = locs(xml);\n        const productMaps = children.filter(u => /product/i.test(u));\n        const useful = productMaps.length ? productMaps : children.filter(u => !/(post|page|blog|article|author|tag|categor|collection|image|video|news)/i.test(u));\n        queue.unshift(...useful.map(url => ({ url, product: /product/i.test(url) })));\n      } else if (/<urlset/i.test(xml)) {\n        for (const block of xml.split(/<url>/i).slice(1)) {\n          const u = (locs(block)[0] || '').split('#')[0];\n          const path = urlParts(u)?.pathname || '/';\n          if (!/^https?:\\/\\//i.test(u) || path === '/' || NOT_PRODUCT.test(path)) continue;\n          const images = [...block.matchAll(/<image:loc>\\s*(?:<!\\[CDATA\\[)?\\s*([^<\\]]+?)\\s*(?:\\]\\]>)?\\s*<\\/image:loc>/gi)].map(m => decodeHtml(m[1]));\n          const lastmod = (block.match(/<lastmod>\\s*([^<]+?)\\s*<\\/lastmod>/i) || [])[1] || null;\n          (sm.product ? fromProductMaps : fromOtherMaps).set(u, { images, lastmod });\n        }\n      }\n    }\n    const catalog = fromProductMaps.size ? fromProductMaps : new Map([...fromOtherMaps].filter(([u]) => LOOKS_PRODUCT.test(u)));\n\n    // Listing pages linked from the homepage: best sellers + new arrivals. Cards labelled \"Best Seller\" count too.\n    const bestUrls = [], newUrls = [], catUrls = [];\n    const productLinks = html => {\n      const res = [];\n      const hits = [...String(html).matchAll(/href=[\"']([^\"'#]+)[\"']/gi)];\n      hits.forEach((m, i) => {\n        const u0 = absolute(m[1]); const u = /[?&](product_id|id_product|route=product)/i.test(u0) ? u0.replace(/&amp;/g, '&') : u0.split('?')[0];\n        if (!u || urlParts(u)?.host !== host) return;\n        const path = urlParts(u)?.pathname || '/';\n        if (path === '/' || NOT_PRODUCT.test(path)) return;\n        const known = [...catalog.keys()].find(k => canonicalUrl(k) === canonicalUrl(u));\n        if (!known && !LOOKS_PRODUCT.test(u)) return;\n        const next = hits.slice(i + 1).find(n => absolute(n[1]).split('?')[0] !== u);\n        const card = String(html).slice(m.index, next ? next.index : m.index + 3000);\n        const labelled = /best[-_ ]?seller/i.test(card.replace(/href=[\"'][^\"']*[\"']/gi, ''));\n        res.push({ url: known || u, labelled });\n      });\n      return res;\n    };\n    if (!blocked && timeLeft()) {\n      const home = homePage;\n      const links = [...new Set([...String(home.text || '').matchAll(/href=[\"']([^\"'#]+)[\"']/gi)].map(m => absolute(m[1]))\n        .filter(u => u && urlParts(u)?.host === host))];\n      productLinks(home.text || '').forEach(p => { if (p.labelled) bestUrls.push(p.url); });\n      const lists = [\n        ...links.filter(u => BEST.test(u)).slice(0, 2).map(u => ({ u, best: true })),\n        ...links.filter(u => NEW.test(u) && !BEST.test(u)).slice(0, 1).map(u => ({ u, best: false })),\n        ...links.filter(u => !BEST.test(u) && !NEW.test(u) && !LOOKS_PRODUCT.test(u) && /jacket|leather|biker|bomber|moto|shearling|suede|men|women/i.test(urlParts(u)?.pathname || '') && !/coat|blazer|suit|tux|wool|vest|bag|wallet|glove|shoe|boot/i.test(urlParts(u)?.pathname || ''))\n          .slice(0, catalog.size ? 0 : 3).map(u => ({ u, best: false, cat: true }))\n      ];\n      for (const l of lists) {\n        if (!timeLeft() || blocked) break;\n        const r = await get(l.u);\n        if (r.blocked) { blocked = r.blocked; break; }\n        for (const p of productLinks(r.text || '')) (l.best || p.labelled ? bestUrls : l.cat ? catUrls : newUrls).push(p.url);\n      }\n    }\n\n    // Order: best sellers first, then newest by lastmod; leather jackets only\n    const isJacketUrl = u => isLeatherJacket('leather ' + decodeURIComponent(urlParts(u)?.pathname || ''), c.allow_faux);\n    const newest = [...catalog].sort((a, b) => String(b[1].lastmod || '').localeCompare(String(a[1].lastmod || ''))).map(([u]) => u);\n    const bestSet = new Set(bestUrls.map(canonicalUrl));\n    for (const url of [...new Set([...bestUrls, ...newUrls, ...newest, ...catUrls])]) {\n      if (out.length >= c.max_pages_per_site) break;\n      if (!isJacketUrl(url)) continue;\n      const hash = sha256(canonicalUrl(url));\n      if (seen.has(hash)) continue;\n      seen.add(hash);\n      const info = catalog.get(url) || {};\n      out.push({ kind: 'page', origin, url, sitemap_images: info.images || [], listed_at: info.lastmod || (newUrls.includes(url) ? new Date().toISOString() : null), is_bestseller: bestSet.has(canonicalUrl(url)), url_hash: hash });\n    }\n  }\n\n  if (!out.length) out.push({ kind: 'notice', origin, requests: get.log.slice(0, 30), reason: blocked ? `${blocked} - whitelist the n8n server IP in the site firewall` : 'No products, product feed or sitemap found' });\n  const notice = out.find(o => o.kind === 'notice');\n  await report(this.helpers, c, { step: 'Website · ' + (urlParts(origin)?.host || origin), status: notice ? 'error' : 'done', count: out.length - (notice ? 1 : 0),\n    detail: notice ? origin + ': ' + notice.reason : `${out.length} jackets / product pages found (best sellers + newest)` });\n  return out.map(json => ({ json }));\n"
+      },
+      "id": "e829c077-45de-4935-bfb5-853da32eda2e",
+      "name": "Discover Website Products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        600
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6949a628-6026-4302-acbc-b2bd344e983a",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "page",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9e95e42d-59b6-4528-b693-070964760112",
+      "name": "Is Page To Scrape?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 48,
+        "options": {}
+      },
+      "id": "b00afd59-d61d-4936-b979-7b4e1890c1fa",
+      "name": "Loop Over Product Pages",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1344,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ingestion key arrives with the hunt request (checked by \"Authorized Leather Hunt?\"); it is not written in the nodes.\nconst KEY = () => (($('Leather Hunt Webhook').first().json || {}).headers || {})['x-ingestion-key'] || '';\n// Was this hunt stopped (or timed out) in the dashboard? Then every step quits straight away.\nasync function shouldStop(helpers) {\n  try {\n    const c = $('Hunt Config').first().json;\n    if (!c.run_id) return false;\n    const r = await helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/state?runId=' + encodeURIComponent(c.run_id), method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 5000 });\n    return !!(r && r.stop);\n  } catch (e) { return false; }\n}\nfunction inPriceRange(price, cfg) {\n  const p = Number(price);\n  if (!Number.isFinite(p) || p <= 0) return cfg.include_unpriced === true;\n  return p >= cfg.min_price && p <= cfg.max_price;\n}\n\nfunction httpsImages(values) {\n  return [...new Set(values.flat(Infinity).map(v => typeof v === 'string' ? v : (v && (v.imageUrl || v.url_fullxfull || v.url_570xN || v.contentUrl || v.url || v.src)) || '')\n    .map(v => String(v || '').trim().replace(/&amp;/g, '&').replace(/^\\/\\//, 'https://').replace(/^http:\\/\\//i, 'https://'))\n    .filter(v => /^https:\\/\\//i.test(v))\n    .filter(v => !/\\.(gif|svg)(\\?|$)/i.test(v))\n    .filter(v => !/(placeholder|no[-_ ]?image|logo|favicon|sprite|icon|avatar|pixel|size[-_ ]?chart|payment|badge)/i.test(v)))];\n}\n\nfunction sha256(input) {\n  // Pure JS SHA-256 (n8n blocks require('crypto') by default)\n  const bytes = unescape(encodeURIComponent(String(input)));\n  const K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];\n  const H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];\n  const l = bytes.length;\n  const words = [];\n  for (let i = 0; i < l; i++) words[i >> 2] |= bytes.charCodeAt(i) << (24 - (i % 4) * 8);\n  words[l >> 2] |= 0x80 << (24 - (l % 4) * 8);\n  words[(((l + 8) >> 6) + 1) * 16 - 1] = l * 8;\n  const r = (x, n) => (x >>> n) | (x << (32 - n));\n  for (let j = 0; j < words.length; j += 16) {\n    const w = Array.from({ length: 16 }, (_, k) => words[j + k] | 0);\n    let [a, b, c, d, e, f, g, h] = H;\n    for (let i = 0; i < 64; i++) {\n      if (i >= 16) {\n        const s0 = r(w[i - 15], 7) ^ r(w[i - 15], 18) ^ (w[i - 15] >>> 3);\n        const s1 = r(w[i - 2], 17) ^ r(w[i - 2], 19) ^ (w[i - 2] >>> 10);\n        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;\n      }\n      const t1 = (h + (r(e, 6) ^ r(e, 11) ^ r(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;\n      const t2 = ((r(a, 2) ^ r(a, 13) ^ r(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;\n      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;\n    }\n    H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;\n    H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;\n  }\n  return H.map(x => (x >>> 0).toString(16).padStart(8, '0')).join('');\n}\n\nfunction urlParts(value) {\n  // n8n Code nodes have no URL class, so split URLs by hand\n  const m = String(value || '').trim().match(/^(https?):\\/\\/([^\\/?#:]+)(:\\d+)?([^?#]*)/i);\n  if (!m) return null;\n  const host = m[2].toLowerCase();\n  return { origin: m[1].toLowerCase() + '://' + host + (m[3] || ''), host, pathname: m[4] || '/' };\n}\n\nfunction makeGet(helpers, deadline = Date.now() + 50000) {\n  // Fetch with block detection. n8n Code nodes are limited to 60s, so timeouts stay short.\n  const BLOCK = /sgcaptcha|challenge-platform|cf-chl|cf_chl|sucuri_cloudproxy|Just a moment\\.\\.\\.|Attention Required/i;\n  const blockName = t => /sgcaptcha/i.test(t) ? 'SiteGround CAPTCHA' : /sucuri/i.test(t) ? 'Sucuri firewall' : 'Cloudflare challenge';\n  const wait = ms => new Promise(r => setTimeout(r, ms));\n  const log = [];\n  const note = (url, result) => { log.push(url.replace(/^https?:\\/\\/[^\\/]+/, '') + ' -> ' + result); return log.length; };\n  async function get(url, json = false, timeout = 12000) {\n    for (let attempt = 0; attempt < 2; attempt++) {\n      // never run past n8n's 60 s limit: shorter timeout near the end, nothing new when time is up\n      const left = deadline - Date.now();\n      if (left < 3000) return { status: 0, skipped: 'out of time' };\n      timeout = Math.min(timeout, left - 1500);\n      try {\n        // Plain request, same as n8n's HTTP Request node (no browser User-Agent)\n        const res = await helpers.httpRequest({ url, method: 'GET', timeout });\n        const text = typeof res === 'string' ? res : (Buffer.isBuffer(res) ? res.toString('utf8') : null);\n        if (text && BLOCK.test(text.slice(0, 4000))) { note(url, 'blocked: ' + blockName(text)); return { blocked: blockName(text) }; }\n        note(url, 'ok ' + (text !== null ? text.length + ' chars' + (/<urlset|<sitemapindex/i.test(text.slice(0, 600)) ? ' (sitemap)' : /^\\s*[\\[{]/.test(text) ? ' (json)' : /<html/i.test(text.slice(0, 600)) ? ' (html)' : '') : 'object'));\n        if (json) {\n          if (text === null) return { data: res };\n          try { return { data: JSON.parse(text) }; } catch { return {}; }\n        }\n        return { text: text !== null ? text : JSON.stringify(res) };\n      } catch (e) {\n        const status = Number(e.httpCode || e.statusCode || e.response?.status || e.cause?.response?.status || e.cause?.status || (String(e.message || '').match(/status code (\\d{3})/) || [])[1] || 0);\n        const body = String(e.response?.body || e.response?.data || e.cause?.response?.data || e.description || '');\n        note(url, (status ? 'HTTP ' + status : 'error') + ' ' + String(e.message || '').slice(0, 80));\n        if (BLOCK.test(body.slice(0, 4000))) return { blocked: blockName(body) };\n        if (status === 403 && attempt === 1) return { blocked: 'HTTP 403 Forbidden (firewall)' };\n        if (attempt === 0 && [403, 429, 503].includes(status) && deadline - Date.now() > 15000) { await wait(3000); continue; }\n        return { status };\n      }\n    }\n    return {};\n  }\n  get.log = log;\n  return get;\n}\n\nfunction decodeHtml(s) {\n  return String(s || '').replace(/&amp;/g, '&').replace(/&#39;|&#039;|&#8217;/g, \"'\").replace(/&quot;/g, '\"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&#8211;/g, '-').trim();\n}\n\nfunction stripHtml(html) {\n  return decodeHtml(String(html || '').replace(/<style[\\s\\S]*?<\\/style>|<script[\\s\\S]*?<\\/script>/gi, ' ').replace(/<br\\s*\\/?>|<\\/p>|<\\/li>/gi, '\\n').replace(/<[^>]+>/g, ' ')).replace(/[ \\t]+/g, ' ').replace(/\\n\\s*\\n+/g, '\\n').trim().slice(0, 6000);\n}\n\nfunction canonicalUrl(url) {\n  // lowercase host, no www, no query/hash, no trailing slash, no /collections/x/ prefix\n  const u = urlParts(url);\n  if (!u) return String(url).toLowerCase();\n  const path = u.pathname.replace(/\\/collections\\/[^/]+(?=\\/products\\/)/i, '').replace(/\\/+$/, '').toLowerCase();\n  return u.host.replace(/^www\\./, '') + path;\n}\n\nfunction siteBase(origin) {\n  const domain = urlParts(origin).host.replace(/^www\\./, '');\n  return { source: 'website', marketplace: 'Website', source_domain: domain, seller_name: domain, market: '', search_query: 'full catalog', condition: 'New' };\n}\n\nfunction isLeatherJacket(text, allowFaux) {\n  const t = String(text || '').toLowerCase().replace(/%20|[-_/+]+/g, ' ');\n  if (!/\\bleather\\b|\\bsuede\\b|\\bshearling\\b|\\bnappa\\b|\\blambskin\\b|\\bcowhide\\b/.test(t)) return false;\n  if (!/\\b(jacket|jackets|bomber|biker|moto|motorcycle|racer|trucker|aviator|blouson|shacket)\\b/.test(t)) return false;\n  // other products that mention leather jackets (a jacket \"with belt\", a \"shirt jacket\" or \"wool lining\" still counts)\n  if (/\\b(vest|waistcoat|gilet|pants|trousers|skirt|chaps|pattern|pdf|patch|patches|sticker|keychain|keyring|key ring|wallet|bag|purse|gloves|boots|shoes|hanger|cleaner|conditioner|toy|doll|barbie|dog|helmet|lot of|bundle|phone case|case for|earring|earrings|necklace|magnet|ornament|miniature)\\b/.test(t)) return false;\n  if (/\\b(overcoat|trench|duster|parka|peacoat|tuxedo|suit|suits|turtleneck|sweater|hoodie only)\\b/.test(t)) return false;\n  if (/\\b(coat|coats)\\b/.test(t) && !/\\bjackets?\\b/.test(t)) return false;\n  if (!allowFaux && /\\b(faux|vegan|pu leather|pleather|leatherette|imitation|synthetic leather)\\b/.test(t)) return false;\n  return true;\n}\n\n  // 6 product pages per run (Loop Over Product Pages) so each run stays well under n8n's 60s limit\n  const c = $('Hunt Config').first().json;\n  if (await shouldStop(this.helpers)) return [];\n  const get = makeGet(this.helpers, Date.now() + 52000);\n  const wait = ms => new Promise(r => setTimeout(r, ms));\n  const out = [];\n\n  function findProductLd(html) {\n    const blocks = [...html.matchAll(/<script[^>]*type=[\"']application\\/ld\\+json[\"'][^>]*>([\\s\\S]*?)<\\/script>/gi)];\n    const walk = node => {\n      if (!node || typeof node !== 'object') return null;\n      if (Array.isArray(node)) { for (const n of node) { const f = walk(n); if (f) return f; } return null; }\n      const type = [].concat(node['@type'] || []).map(String);\n      if (type.some(t => /^(Product|ProductGroup|IndividualProduct)$/i.test(t))) return node;\n      return walk(node['@graph']) || null;\n    };\n    for (const b of blocks) { try { const f = walk(JSON.parse(b[1].trim())); if (f) return f; } catch {} }\n    return null;\n  }\n  const meta = (html, prop) => {\n    const re = new RegExp(`<meta[^>]+(?:property|name|itemprop)=[\"']${prop}[\"'][^>]*>`, 'gi');\n    return [...html.matchAll(re)].map(m => (m[0].match(/content=[\"']([^\"']*)[\"']/i) || [])[1]).filter(Boolean).map(decodeHtml);\n  };\n\n  async function readPage(page) {\n    const r = await get(page.url, false, 8000);\n    if (r.blocked) {\n      out.push({ kind: 'notice', origin: page.origin, reason: `${r.blocked} while reading product pages - whitelist the n8n server IP` });\n      blockedHosts.add(page.origin);\n      return;\n    }\n    const html = r.text || '';\n    const node = findProductLd(html);\n    if (!node && !/product/i.test(meta(html, 'og:type')[0] || '') && !meta(html, 'product:price:amount').length) return;\n\n    const ld = node || {};\n    let offers = [].concat(ld.offers || (ld.hasVariant || []).map(v => v.offers) || []).flat().filter(Boolean);\n    if (offers[0]?.offers) offers = [].concat(offers[0].offers);\n    const offer = offers.find(o => o.price || o.lowPrice) || offers[0] || {};\n    const price = Number(String(offer.price ?? offer.lowPrice ?? meta(html, 'product:price:amount')[0] ?? meta(html, 'og:price:amount')[0] ?? '').replace(/[^0-9.]/g, ''));\n    const rating = ld.aggregateRating || {};\n    const images = httpsImages([page.sitemap_images || [], ld.image || [], meta(html, 'og:image'), meta(html, 'og:image:secure_url')]).slice(0, 30);\n    const title = decodeHtml(ld.name || meta(html, 'og:title')[0] || (html.match(/<title>([^<]*)<\\/title>/i) || [])[1]);\n\n    if (title && images.length && inPriceRange(price, c) && isLeatherJacket(title + ' ' + page.url.replace(/^https?:\\/\\/[^\\/]+/, ''), c.allow_faux)) {\n      out.push({\n        ...siteBase(page.origin),\n        kind: 'product',\n        product_id: page.url_hash,\n        is_bestseller: !!page.is_bestseller,\n        listed_at: page.listed_at || null,\n        url_hash: page.url_hash,\n        product_name: title,\n        product_link: page.url.split('?')[0],\n        source_price: Number.isFinite(price) && price > 0 ? price : null,\n        source_currency: offer.priceCurrency || meta(html, 'product:price:currency')[0] || 'USD',\n        image_urls: images,\n        description: stripHtml(ld.description || meta(html, 'og:description')[0] || meta(html, 'description')[0]),\n        brand: decodeHtml(typeof ld.brand === 'string' ? ld.brand : ld.brand?.name || ''),\n        rating: Number(rating.ratingValue || 0),\n        review_count: Number(rating.reviewCount || rating.ratingCount || 0),\n        raw_details: {\n          platform: 'generic',\n          sku: ld.sku || '',\n          availability: String(offer.availability || '').replace(/^https?:\\/\\/schema\\.org\\//, ''),\n          material: ld.material || '',\n          color: ld.color || ''\n        }\n      });\n    }\n  }\n\n  // Read pages in parallel: up to 4 at a time per site, every site at the same time. Stops early if a site blocks us.\n  const blockedHosts = new Set();\n  const pages = $input.all().map(i => i.json);\n  const byHost = {};\n  for (const p of pages) (byHost[p.origin] ||= []).push(p);\n  const started = Date.now();\n  await Promise.all(Object.values(byHost).map(async list => {\n    let next = 0;\n    await Promise.all(Array.from({ length: Math.min(4, list.length) }, async () => {\n      while (next < list.length && Date.now() - started < 48000) {\n        const page = list[next++];\n        if (blockedHosts.has(page.origin)) return;\n        try { await readPage(page); } catch {}\n        await wait(150);\n      }\n    }));\n  }));\n  try {\n    const cfg = $('Hunt Config').first().json;\n    if (cfg.run_id) await this.helpers.httpRequest({ url: cfg.dashboard_url + '/api/hunt/progress', method: 'POST', headers: { 'X-Ingestion-Key': KEY() }, body: { runId: cfg.run_id, step: 'Reading product pages', status: 'running', detail: pages.length + ' pages read in the latest batch' }, json: true, timeout: 5000 });\n  } catch (e) {}\n  return out.map(json => ({ json }));\n"
+      },
+      "id": "372cbf2d-4196-4f38-8472-3a7429b30f42",
+      "name": "Scrape Product Pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        600
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "numberInputs": 6
+      },
+      "id": "97c21adc-1038-4363-b000-53bb0e2ac21f",
+      "name": "Merge All Sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2016,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ingestion key arrives with the hunt request (checked by \"Authorized Leather Hunt?\"); it is not written in the nodes.\nconst KEY = () => (($('Leather Hunt Webhook').first().json || {}).headers || {})['x-ingestion-key'] || '';\n// Was this hunt stopped (or timed out) in the dashboard? Then every step quits straight away.\nasync function shouldStop(helpers) {\n  try {\n    const c = $('Hunt Config').first().json;\n    if (!c.run_id) return false;\n    const r = await helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/state?runId=' + encodeURIComponent(c.run_id), method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 5000 });\n    return !!(r && r.stop);\n  } catch (e) { return false; }\n}\nfunction isLeatherJacket(text, allowFaux) {\n  const t = String(text || '').toLowerCase().replace(/%20|[-_/+]+/g, ' ');\n  if (!/\\bleather\\b|\\bsuede\\b|\\bshearling\\b|\\bnappa\\b|\\blambskin\\b|\\bcowhide\\b/.test(t)) return false;\n  if (!/\\b(jacket|jackets|bomber|biker|moto|motorcycle|racer|trucker|aviator|blouson|shacket)\\b/.test(t)) return false;\n  // other products that mention leather jackets (a jacket \"with belt\", a \"shirt jacket\" or \"wool lining\" still counts)\n  if (/\\b(vest|waistcoat|gilet|pants|trousers|skirt|chaps|pattern|pdf|patch|patches|sticker|keychain|keyring|key ring|wallet|bag|purse|gloves|boots|shoes|hanger|cleaner|conditioner|toy|doll|barbie|dog|helmet|lot of|bundle|phone case|case for|earring|earrings|necklace|magnet|ornament|miniature)\\b/.test(t)) return false;\n  if (/\\b(overcoat|trench|duster|parka|peacoat|tuxedo|suit|suits|turtleneck|sweater|hoodie only)\\b/.test(t)) return false;\n  if (/\\b(coat|coats)\\b/.test(t) && !/\\bjackets?\\b/.test(t)) return false;\n  if (!allowFaux && /\\b(faux|vegan|pu leather|pleather|leatherette|imitation|synthetic leather)\\b/.test(t)) return false;\n  return true;\n}\n\nfunction inPriceRange(price, cfg) {\n  const p = Number(price);\n  if (!Number.isFinite(p) || p <= 0) return cfg.include_unpriced === true;\n  return p >= cfg.min_price && p <= cfg.max_price;\n}\n\nfunction httpsImages(values) {\n  return [...new Set(values.flat(Infinity).map(v => typeof v === 'string' ? v : (v && (v.imageUrl || v.url_fullxfull || v.url_570xN || v.contentUrl || v.url || v.src)) || '')\n    .map(v => String(v || '').trim().replace(/&amp;/g, '&').replace(/^\\/\\//, 'https://').replace(/^http:\\/\\//i, 'https://'))\n    .filter(v => /^https:\\/\\//i.test(v))\n    .filter(v => !/\\.(gif|svg)(\\?|$)/i.test(v))\n    .filter(v => !/(placeholder|no[-_ ]?image|logo|favicon|sprite|icon|avatar|pixel|size[-_ ]?chart|payment|badge)/i.test(v)))];\n}\n\nfunction sha256(input) {\n  // Pure JS SHA-256 (n8n blocks require('crypto') by default)\n  const bytes = unescape(encodeURIComponent(String(input)));\n  const K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];\n  const H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];\n  const l = bytes.length;\n  const words = [];\n  for (let i = 0; i < l; i++) words[i >> 2] |= bytes.charCodeAt(i) << (24 - (i % 4) * 8);\n  words[l >> 2] |= 0x80 << (24 - (l % 4) * 8);\n  words[(((l + 8) >> 6) + 1) * 16 - 1] = l * 8;\n  const r = (x, n) => (x >>> n) | (x << (32 - n));\n  for (let j = 0; j < words.length; j += 16) {\n    const w = Array.from({ length: 16 }, (_, k) => words[j + k] | 0);\n    let [a, b, c, d, e, f, g, h] = H;\n    for (let i = 0; i < 64; i++) {\n      if (i >= 16) {\n        const s0 = r(w[i - 15], 7) ^ r(w[i - 15], 18) ^ (w[i - 15] >>> 3);\n        const s1 = r(w[i - 2], 17) ^ r(w[i - 2], 19) ^ (w[i - 2] >>> 10);\n        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;\n      }\n      const t1 = (h + (r(e, 6) ^ r(e, 11) ^ r(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;\n      const t2 = ((r(a, 2) ^ r(a, 13) ^ r(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;\n      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;\n    }\n    H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;\n    H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;\n  }\n  return H.map(x => (x >>> 0).toString(16).padStart(8, '0')).join('');\n}\n\nasync function report(helpers, cfg, body) {\n  // Tells the dashboard how the hunt is going. Never stops the hunt if the dashboard can't be reached.\n  if (!cfg || !cfg.run_id || !cfg.dashboard_url) return;\n  try {\n    await helpers.httpRequest({ url: cfg.dashboard_url + '/api/hunt/progress', method: 'POST', headers: { 'X-Ingestion-Key': KEY() }, body: { runId: cfg.run_id, ...body }, json: true, timeout: 5000 });\n  } catch (e) {}\n}\n\n  // Scores every candidate on BEST SELLER + LATEST + quality, skips jackets already on the\n  // dashboard and keeps only the best N (default 10) for this run.\n  const c = $('Hunt Config').first().json;\n  const helpers = this.helpers;\n  if (await shouldStop(helpers)) return [];\n  const items = $input.all().map(i => i.json).filter(Boolean);\n  const notices = items.filter(j => j.kind === 'notice').map(j => `${j.origin}: ${j.reason}${j.requests ? ' [' + j.requests.join('; ') + ']' : ''}`);\n\n  // Jackets saved by earlier runs (dashboard keys = sha256(source:id))\n  let known = new Set();\n  try {\n    const res = await helpers.httpRequest({ url: c.dashboard_url + '/api/known', method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 15000 });\n    const data = typeof res === 'string' ? JSON.parse(res) : res;\n    known = new Set([...(data.keys || []), ...(data.contentHashes || [])]);\n  } catch (e) {\n    // without this list every old jacket would be saved again: stop and say why\n    await report(helpers, c, { step: 'Choosing the best', status: 'error', detail: 'n8n could not reach the dashboard to check which jackets you already have', failed: true, error: 'Dashboard unreachable from n8n: ' + String(e.message || '').slice(0, 120) });\n    throw new Error('Dashboard unreachable - stopping so nothing is saved twice');\n  }\n  // prices are compared in USD (UK / Canada listings are in their own currency)\n  const FX = { USD: 1, GBP: 1.27, CAD: 0.73, EUR: 1.08, AUD: 0.66 };\n  const usd = p => { const v = Number(p.source_price); return Number.isFinite(v) && v > 0 ? v * (FX[String(p.source_currency || 'USD').toUpperCase()] || 1) : v; };\n  // the same photo identity the dashboard uses (Google / eBay picture ids, otherwise shop + file name)\n  const imageId = u => { const s = String(u || ''); const t = s.match(/tbn:([\\w-]{12,})/); if (t) return 'tbn:' + t[1]; const e = s.match(/\\/images\\/g\\/([^/]{6,})\\//); if (e) return 'ebay:' + e[1]; const m = s.match(/^https?:\\/\\/([^\\/?#]+)([^?#]*)/i); return m ? m[1].replace(/^www\\./, '') + '/' + m[2].split('/').pop().replace(/_\\d+x\\d*|_(?:large|grande|master)/gi, '') : s.split('?')[0].split('/').pop(); };\n\n  function gender(text) {\n    const t = String(text || '').toLowerCase();\n    if (/unisex|gender[- ]neutral/.test(t)) return 'Unisex';\n    if (/\\b(women|womens|women's|woman|ladies|lady|female)\\b/.test(t)) return 'Women';\n    if (/\\b(men|mens|men's|man|male|gentlemen)\\b/.test(t)) return 'Men';\n    return 'Unisex';\n  }\n  const now = Date.now();\n  function ageDays(v) {\n    if (v === null || v === undefined || v === '') return null;\n    const t = typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);\n    return Number.isFinite(t) ? Math.max(0, (now - t) / 864e5) : null;\n  }\n\n  const seen = new Set();\n  const scored = [];\n  for (const p of items) {\n    if (!p.product_name || !p.product_link || !p.product_id) continue;\n    if (!isLeatherJacket(p.product_name + (p.source === 'website' ? ' ' + String(p.product_link).replace(/^https?:\\/\\/[^\\/]+/, '') : ''), c.allow_faux)) continue;\n    if (!inPriceRange(usd(p), c)) continue;\n    const images = httpsImages([p.image_urls || []]);\n    if (!images.length) continue;\n    const idHash = sha256(p.source + ':' + p.product_id);\n    const contentHash = sha256('v2|' + String(p.product_name).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim() + '|' + imageId(images[0]));\n    if (seen.has(idHash) || seen.has(contentHash) || known.has(idHash) || known.has(contentHash)) continue;\n    seen.add(idHash);\n    seen.add(contentHash);\n\n    const reasons = [];\n    let best = 0, latest = 0, quality = 0;\n    // Popularity: REVIEWS first (more reviews = more people bought it), then sold / favourites. Best-seller tag only a small bonus.\n    // Etsy only gives the SHOP's reviews (not this listing's): a small bonus, not the listing's popularity\n    const reviews = p.source === 'ebay' || p.source === 'etsy' ? 0 : Number(p.review_count || 0);\n    if (p.source === 'etsy' && Number(p.review_count) > 0) { best += Math.min(8, Math.round(Math.log10(Number(p.review_count) + 1) * 2.5)); reasons.push('Shop has ' + p.review_count + ' reviews'); }\n    if (reviews > 0) { best += Math.min(45, Math.round(Math.log10(reviews + 1) * 18)); reasons.push(`${reviews} reviews`); }\n    if (Number(p.rating) >= 4.5 && reviews >= 5) { best += 5; reasons.push(`Rated ${Number(p.rating).toFixed(1)}`); }\n    const sold = Number(p.raw_details?.estimatedSoldQuantity || 0);\n    if (sold > 0) { best += Math.min(35, Math.round(Math.log10(sold + 1) * 16)); reasons.push(`${sold} sold`); }\n    const fav = Number(p.raw_details?.num_favorers || 0);\n    if (fav > 0) { best += Math.min(25, Math.round(Math.log10(fav + 1) * 10)); reasons.push(`${fav} favourites`); }\n    if (p.is_bestseller) { best += 8; reasons.push('In the store best sellers'); }\n    best = Math.min(best, 60);\n    // Latest\n    const age = ageDays(p.listed_at ?? p.raw_details?.original_creation_timestamp ?? p.raw_details?.creation_timestamp);\n    if (age !== null) {\n      if (age <= 14) latest = 15; else if (age <= 45) latest = 10; else if (age <= 120) latest = 5; else if (age <= 365) latest = 2;\n      if (latest) reasons.push(age < 1 ? 'Listed today' : `Listed ${Math.round(age)} days ago`);\n    }\n    // Quality\n    if (images.length >= 6) quality += 8; else if (images.length >= 3) quality += 4;\n    if (/genuine|real leather|lambskin|cowhide|sheepskin|nappa|full grain|shearling/i.test(p.product_name + ' ' + (p.description || ''))) { quality += 6; reasons.push('Genuine leather'); }\n    if (p.description && p.description.length > 80) quality += 3;\n    if (Number(p.search_rank) && Number(p.search_rank) <= 5) quality += 3;\n    reasons.push(`${images.length} images`);\n\n    scored.push({\n      ...p,\n      run_id: c.run_id,\n      id_hash: idHash,\n      content_hash: contentHash,\n      gender: gender(p.product_name + ' ' + p.product_link + ' ' + (p.raw_details?.localizedAspects || []).map(a => a.value).join(' ')),\n      primary_image_url: images[0],\n      image_urls: images.slice(0, 24),\n      image_count: Math.min(images.length, 24),\n      bestseller_score: best,\n      latest_score: latest,\n      trend_score: Math.min(100, best + latest + quality + 5),\n      score_reasons: reasons,\n      category: 'Leather Jacket',\n      material: /suede/i.test(p.product_name) ? 'Suede Leather' : /faux|vegan|pu leather/i.test(p.product_name) ? 'Faux Leather' : 'Leather',\n      price_range: { min: c.min_price, max: c.max_price },\n      hunted_at: new Date().toISOString()\n    });\n  }\n\n  // Must be both popular and recent where possible: rank by total, ties -> newer first\n  let top;\n  if (c.mode === 'trend') {\n    const perTopic = {};\n    top = scored.sort((a, b) => (a.search_rank || 99) - (b.search_rank || 99))\n      .filter(p => (perTopic[p.trend_topic] = (perTopic[p.trend_topic] || 0) + 1) <= 10);\n  } else {\n    // Fair share: every site / source gets jackets in proportion to how many it offered,\n    // at least 1 each and never more than 35% of the hunt, so one shop can't take everything.\n    const byScore = (a, b) => b.trend_score - a.trend_score || b.bestseller_score - a.bestseller_score || b.latest_score - a.latest_score;\n    const siteOf = p => p.source === 'website' ? (p.source_domain || 'website') : (p.source === 'google_shopping' ? 'google:' + (p.source_domain || '') : p.source);\n    const groups = {};\n    for (const p of scored) (groups[siteOf(p)] ||= []).push(p);\n    for (const k in groups) groups[k].sort(byScore);\n    const sites = Object.keys(groups), total = scored.length || 1, cap = Math.max(1, Math.ceil(c.top_n * 0.35));\n    const quota = {};\n    for (const k of sites) quota[k] = Math.min(cap, Math.max(1, Math.round(c.top_n * groups[k].length / total)));\n    top = [];\n    for (const k of sites.sort((x, y) => byScore(groups[x][0], groups[y][0]))) top.push(...groups[k].slice(0, quota[k]));\n    top.sort(byScore);\n    if (top.length > c.top_n) top = top.slice(0, c.top_n);\n    // still room (few sites): fill with the best of the rest, up to the cap per site\n    if (top.length < c.top_n) {\n      const count = {}; for (const p of top) count[siteOf(p)] = (count[siteOf(p)] || 0) + 1;\n      for (const p of scored.slice().sort(byScore)) {\n        if (top.length >= c.top_n) break;\n        if (top.includes(p)) continue;\n        const k = siteOf(p);\n        if ((count[k] || 0) >= cap && sites.length > 1) continue;\n        top.push(p); count[k] = (count[k] || 0) + 1;\n      }\n    }\n  }\n  console.log(`Candidates ${scored.length}, kept best ${top.length}`);\n  if (!top.length && notices.length) {\n    await report(helpers, c, { step: 'Choosing the best', status: 'error', detail: notices.join(' | '), failed: true, error: 'No products to save. ' + notices.join(' | ') });\n    throw new Error('No products to save. ' + notices.join(' | '));\n  }\n  await report(helpers, c, { step: 'Choosing the best', status: 'done', count: top.length,\n    detail: `Kept ${top.length} of ${scored.length} new candidates` + (notices.length ? ` · ${notices.length} source notice(s)` : ''), ...(top.length ? {} : { finished: true }) });\n  if (top.length) await report(helpers, c, { step: 'Saving jackets + photos', status: 'running', detail: `Saving ${top.length} jackets` });\n  return top.map(json => ({ json }));\n"
+      },
+      "id": "9d9ddf4f-827e-49ce-90e5-856df3b07f10",
+      "name": "Leather Jacket Final Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Hunt Config').first().json.dashboard_url + '/api/ingest' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Ingestion-Key",
+              "value": "={{ $('Leather Hunt Webhook').first().json.headers['x-ingestion-key'] }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "b8fcd256-4681-48e3-8724-6d3ab2289984",
+      "name": "Save Leather Jacket to Dashboard API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2912,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ingestion key arrives with the hunt request (checked by \"Authorized Leather Hunt?\"); it is not written in the nodes.\nconst KEY = () => (($('Leather Hunt Webhook').first().json || {}).headers || {})['x-ingestion-key'] || '';\n// Was this hunt stopped (or timed out) in the dashboard? Then every step quits straight away.\nasync function shouldStop(helpers) {\n  try {\n    const c = $('Hunt Config').first().json;\n    if (!c.run_id) return false;\n    const r = await helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/state?runId=' + encodeURIComponent(c.run_id), method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 5000 });\n    return !!(r && r.stop);\n  } catch (e) { return false; }\n}\nconst c = $('Hunt Config').first().json;\nconst saved = $input.all().reduce((n, i) => n + (Number(i.json && i.json.saved) || 0), 0); // real saves, not just answers\ntry {\n  await this.helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/progress', method: 'POST', headers: { 'X-Ingestion-Key': KEY() },\n    body: { runId: c.run_id, step: 'Saving jackets + photos', status: 'done', count: saved, detail: saved + ' jackets saved with their photos', finished: true }, json: true, timeout: 5000 });\n} catch (e) {}\nreturn [{ json: { finished: true, saved } }];"
+      },
+      "id": "04db5238-4c06-4994-a697-998c5530bc8c",
+      "name": "Hunt Finished",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2688,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "id": "da2eda88-7992-48c9-9232-ec37344e6ad3",
+      "name": "Loop Over Jackets To Save",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2464,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ingestion key arrives with the hunt request (checked by \"Authorized Leather Hunt?\"); it is not written in the nodes.\nconst KEY = () => (($('Leather Hunt Webhook').first().json || {}).headers || {})['x-ingestion-key'] || '';\n// Was this hunt stopped (or timed out) in the dashboard? Then every step quits straight away.\nasync function shouldStop(helpers) {\n  try {\n    const c = $('Hunt Config').first().json;\n    if (!c.run_id) return false;\n    const r = await helpers.httpRequest({ url: c.dashboard_url + '/api/hunt/state?runId=' + encodeURIComponent(c.run_id), method: 'GET', headers: { 'X-Ingestion-Key': KEY() }, json: true, timeout: 5000 });\n    return !!(r && r.stop);\n  } catch (e) { return false; }\n}\n  // n8n downloads each jacket's photos (10 jackets per run, all photos in parallel, well under the 60s limit)\n  // and sends them with the product, so the dashboard never depends on the store's site.\n  const helpers = this.helpers;\n  if (await shouldStop(helpers)) return [];\n  const started = Date.now();\n  const items = $input.all().map(i => i.json);\n  const jobs = [];\n  items.forEach((p, i) => (p.image_urls || []).slice(0, 12).forEach(url => jobs.push({ i, url })));\n  const files = items.map(() => []);\n  let next = 0;\n  await Promise.all(Array.from({ length: Math.min(12, jobs.length) }, async () => {\n    while (next < jobs.length && Date.now() - started < 45000) {\n      const { i, url } = jobs[next++];\n      try {\n        const res = await helpers.httpRequest({ url, method: 'GET', encoding: 'arraybuffer', returnFullResponse: true, timeout: 10000 });\n        const type = String(res.headers['content-type'] || '').split(';')[0].toLowerCase();\n        if (!type.startsWith(\"image/\")) continue; // e.g. a bot-check page instead of the picture\n        const buf = Buffer.from(res.body);\n        if (buf.length < 1000 || buf.length > 4e6) continue;\n        const total = files[i].reduce((s, f) => s + f.size, 0);\n        if (total + buf.length > 30e6) continue;\n        files[i].push({ url, content_type: type, size: buf.length, data: buf.toString('base64') });\n      } catch (e) {}\n    }\n  }));\n  // keep the photo order the store uses\n  return items.map((p, i) => ({ json: { ...p, image_files: files[i].sort((x, y) => p.image_urls.indexOf(x.url) - p.image_urls.indexOf(y.url)), images_downloaded: files[i].length } }));"
+      },
+      "id": "7ab30c4d-a6ad-4776-80f3-870c876cd8d8",
+      "name": "Download Jacket Images",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2688,
+        400
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Leather Hunt Webhook": {
+      "main": [
+        [
+          {
+            "node": "Authorized Leather Hunt?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Authorized Leather Hunt?": {
+      "main": [
+        [
+          {
+            "node": "Google Trends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Trends": {
+      "main": [
+        [
+          {
+            "node": "Hunt Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hunt Config": {
+      "main": [
+        [
+          {
+            "node": "eBay OAuth Token",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Etsy Query Builder",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Website List",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Google Shopping",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 5
+          }
+        ]
+      ]
+    },
+    "Google Shopping": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
+    },
+    "eBay OAuth Token": {
+      "main": [
+        [
+          {
+            "node": "eBay Query Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "eBay Query Builder": {
+      "main": [
+        [
+          {
+            "node": "eBay Leather Jacket Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "eBay Leather Jacket Search": {
+      "main": [
+        [
+          {
+            "node": "eBay Search Extractor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "eBay Search Extractor": {
+      "main": [
+        [
+          {
+            "node": "Fetch eBay Item Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch eBay Item Details": {
+      "main": [
+        [
+          {
+            "node": "eBay Detail Merger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "eBay Detail Merger": {
+      "main": [
+        [
+          {
+            "node": "Report eBay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report eBay": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Etsy Query Builder": {
+      "main": [
+        [
+          {
+            "node": "Etsy Leather Jacket Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Etsy Leather Jacket Search": {
+      "main": [
+        [
+          {
+            "node": "Etsy Search Extractor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Etsy Search Extractor": {
+      "main": [
+        [
+          {
+            "node": "Etsy Batch Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Etsy Batch Builder": {
+      "main": [
+        [
+          {
+            "node": "Fetch Etsy Listing Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Etsy Listing Details": {
+      "main": [
+        [
+          {
+            "node": "Etsy Detail Merger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Etsy Detail Merger": {
+      "main": [
+        [
+          {
+            "node": "Report Etsy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report Etsy": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Website List": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Websites",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Websites": {
+      "main": [
+        [
+          {
+            "node": "Is Page To Scrape?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Discover Website Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discover Website Products": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Websites",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Page To Scrape?": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Product Pages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Loop Over Product Pages": {
+      "main": [
+        [
+          {
+            "node": "Merge All Sources",
+            "type": "main",
+            "index": 3
+          }
+        ],
+        [
+          {
+            "node": "Scrape Product Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scrape Product Pages": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Product Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge All Sources": {
+      "main": [
+        [
+          {
+            "node": "Leather Jacket Final Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leather Jacket Final Gate": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Jackets To Save",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Jackets To Save": {
+      "main": [
+        [
+          {
+            "node": "Hunt Finished",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Download Jacket Images",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Jacket Images": {
+      "main": [
+        [
+          {
+            "node": "Save Leather Jacket to Dashboard API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Leather Jacket to Dashboard API": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Jackets To Save",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
